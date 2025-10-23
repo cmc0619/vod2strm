@@ -1,6 +1,4 @@
 vod2strm – Dispatcharr Plugin
-
-Version: 0.0.1
 Author: ChatGPT (per user spec)
 
 Overview
