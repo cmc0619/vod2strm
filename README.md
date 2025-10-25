@@ -1,123 +1,76 @@
-vod2strm – Dispatcharr Plugin
-Author: ChatGPT (per user spec)
+# VOD STRM Generator Plugin - ThreadPool Version
 
-Overview
+This is the **ThreadPool** version of the VOD STRM Generator plugin for Dispatcharr. It uses multiple threads to write files concurrently, with configurable batching and throttling to prevent system overload.
 
-vod2strm is a Dispatcharr plugin that exports your VOD library (Movies and Series/Episodes) from the internal database into a structured filesystem tree of .strm and .nfo files.
-This allows media servers such as Plex, Emby, or Jellyfin to index Dispatcharr’s VOD items directly without duplicating the underlying media.
+## Key Features - ThreadPool Version
 
-The plugin runs completely inside Dispatcharr, using the ORM for speed and Celery for background jobs (non-blocking UI).
-If Celery isn’t available, it falls back to background threads automatically.
+- **Multi-threaded File Operations**: Uses ThreadPoolExecutor to write files concurrently
+- **Configurable Threading**: Adjust number of worker threads (1-10)
+- **Batch Processing**: Process files in configurable batches to manage memory
+- **Throttling**: Configurable delays between batches to prevent I/O overwhelm
+- **Progress Logging**: Regular progress updates during processing
+- **Resource Control**: Prevents the file-write storm that overwhelmed your system
 
-Features
+## Configuration Options
 
-✅ Movies + Series Support
-Builds .strm files pointing to Dispatcharr’s proxy endpoints
-(/proxy/vod/movies/{uuid} and /proxy/vod/episodes/{uuid}).
+### Standard Options
+- **Output Directory**: Where to write .strm and .nfo files
+- **Dispatcharr Base URL**: URL used in .strm files
+- **Dry Run Mode**: Test without creating files
+- **Verbose Logging**: Show per-item processing logs
+- **Debug Logging**: Write detailed debug logs
+- **Pre-populate Episodes**: Automatically fetch episode data
 
-✅ NFO Generation
-Creates movie.nfo, season.nfo, and SxxExx.nfo beside each .strm.
-Writes only when content changes.
+### ThreadPool-Specific Options
+- **Max File Writer Threads** (default: 4): Number of concurrent file writing threads
+- **Batch Size** (default: 100): Number of files to process in each batch
+- **Throttle Delay** (default: 10ms): Delay between batches to prevent I/O overwhelm
 
-✅ Season 00 (Specials)
-Automatically places season_number = 0 episodes in Season 00 (Specials) folders.
+## How It Works
 
-✅ Cleanup
-Detects and optionally deletes .strm files whose UUIDs no longer exist in the DB.
-Modes: Off | Preview | Apply.
+1. **Preparation Phase**: Collects all file operations into a list (no actual writing)
+2. **Batch Processing**: Splits file operations into manageable batches
+3. **Threaded Execution**: Uses ThreadPoolExecutor to write files concurrently
+4. **Progress Tracking**: Shows progress every batch completion
+5. **Throttling**: Small delays between batches prevent system overload
 
-✅ Fast & Smart
-Skips entire series instantly when filesystem already matches the DB.
-Writes as it goes — no waiting for all series to finish.
+## Performance Characteristics
 
-✅ Robust Debug Logging
-Verbose logs written to /data/plugins/vod2strm/logs/vod2strm.log.
+**Pros:**
+- Much faster than synchronous writing
+- Controllable resource usage via thread count and batching
+- Immediate feedback and progress updates
+- No external dependencies
 
-✅ CSV Reporting
-Every action writes a detailed CSV report to /data/plugins/vod2strm/reports/.
+**Cons:**
+- Still runs in the plugin's `run()` method (blocking UI until complete)
+- Limited by Python's GIL for CPU-bound operations
+- May timeout on very large libraries
 
-✅ Optional Scheduling
-Run automatically via Celery beat using a daily time or full crontab string.
+## Recommended Settings
 
-Output Structure
-/data/STRM/
-├── Movies/
-│   └── Movie Name (2023)/
-│       ├── Movie Name (2023).strm
-│       └── movie.nfo
-└── TV/
-    └── Series Name (2021)/
-        ├── Season 01/
-        │   ├── S01E01 – Episode Title.strm
-        │   ├── S01E01.nfo
-        │   └── season.nfo
-        └── Season 00 (Specials)/
-            └── S00E01 – Special Title.strm
+**For Small Libraries (<1000 files):**
+- Max Threads: 4
+- Batch Size: 50
+- Throttle Delay: 5ms
 
-Settings
-Setting	Type	Default	Description
-Output Root Folder	Text	/data/STRM	Destination for .strm and .nfo files.
-Base URL (for .strm)	Text	http://192.168.199.10:9191	Written inside each .strm file.
-Write NFO files	Boolean	✅	Generate NFO metadata alongside .strms.
-Cleanup	Select	Off	Off / Preview / Apply – removes stale files.
-Filesystem concurrency	Number	12	Parallel file-write workers.
-Robust debug logging	Boolean	☐	Enable verbose logging to /data/plugins/vod2strm/logs/.
-Schedule	Text	(blank)	daily HH:MM or 0 30 3 * * * (crontab) for Celery beat.
-Actions / Buttons
-Action	Description
-Stats (CSV)	Writes a summary CSV (counts from DB + filesystem).
-Generate Movies	Builds .strm + NFO files for all movies.
-Generate Series	Builds .strm + NFO files for all series/episodes.
-Generate All	Runs both Movies + Series and optional Cleanup.
-Reports & Logs
+**For Medium Libraries (1000-5000 files):**
+- Max Threads: 4-6
+- Batch Size: 100
+- Throttle Delay: 10ms
 
-CSV Reports:
-/data/plugins/vod2strm/reports/report_<mode>_<timestamp>.csv
-Columns: type, series_name, season, title, uuid, action, reason
+**For Large Libraries (>5000 files):**
+- Max Threads: 6-8
+- Batch Size: 100-200
+- Throttle Delay: 20ms
 
-Logs:
-/data/plugins/vod2strm/logs/vod2strm.log
+## Installation
 
-Installation
+Same as the standard version - copy to `/data/plugins/vod2strm_threadpool/`
 
-Create plugin directory
+## Use This Version If:
 
-mkdir -p /opt/dispatcharr/plugins/vod2strm
-
-
-Copy files
-
-vod2strm/
-├── __init__.py
-└── plugin.py
-
-
-Restart Dispatcharr (or reload plugins).
-
-Configure via Settings → Plugins → vod2strm.
-
-Versioning Policy
-
-Semantic format MAJOR.MINOR.PATCH
-Starts at 0.0.1 and increments the third digit (e.g., 0.0.2, 0.0.3 …).
-
-Safety Notes
-
-Read-only access to Dispatcharr DB (no modifications).
-
-Writes only within the configured output root.
-
-Compare-before-write prevents redundant I/O.
-
-Cleanup → Apply permanently deletes stale files — use with care.
-
-Future Ideas
-
-Inline CSV preview in the Dispatcharr UI.
-
-Manual “Hydrate Episodes” button for zero-episode series.
-
-Optional filters (year range, group, language).
-
-License
-MIT / Public Domain — use freely, attribution appreciated.
+- You want faster processing than the original synchronous version
+- You need immediate feedback and progress logging
+- You want to stay within the standard plugin architecture
+- You prefer simplicity over the complexity of Celery tasks
