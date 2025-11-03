@@ -554,7 +554,7 @@ class Plugin:
 
     fields = [
         {
-            "key": "output_root",
+            "id": "output_root",
             "label": "Output Root Folder",
             "type": "text",
             "default": DEFAULT_ROOT,
@@ -562,7 +562,7 @@ class Plugin:
             "required": True,
         },
         {
-            "key": "base_url",
+            "id": "base_url",
             "label": "Base URL (for .strm)",
             "type": "text",
             "default": DEFAULT_BASE_URL,
@@ -570,13 +570,13 @@ class Plugin:
             "required": True,
         },
         {
-            "key": "write_nfos",
+            "id": "write_nfos",
             "label": "Write NFO files",
             "type": "boolean",
             "default": True,
         },
         {
-            "key": "cleanup_mode",
+            "id": "cleanup_mode",
             "label": "Cleanup",
             "type": "select",
             "options": [
@@ -587,20 +587,20 @@ class Plugin:
             "default": CLEANUP_OFF,
         },
         {
-            "key": "concurrency",
+            "id": "concurrency",
             "label": "Filesystem concurrency",
             "type": "number",
             "default": 12,
             "help": "Number of concurrent file operations.",
         },
         {
-            "key": "debug_logging",
+            "id": "debug_logging",
             "label": "Robust debug logging",
             "type": "boolean",
             "default": False,
         },
         {
-            "key": "schedule",
+            "id": "schedule",
             "label": "Schedule (crontab string or 'daily HH:MM')",
             "type": "text",
             "default": "",
@@ -609,10 +609,10 @@ class Plugin:
     ]
 
     actions = [
-        {"key": "stats", "label": "Stats (CSV)"},
-        {"key": "generate_movies", "label": "Generate Movies"},
-        {"key": "generate_series", "label": "Generate Series"},
-        {"key": "generate_all", "label": "Generate All"},
+        {"id": "stats", "label": "Stats (CSV)"},
+        {"id": "generate_movies", "label": "Generate Movies"},
+        {"id": "generate_series", "label": "Generate Series"},
+        {"id": "generate_all", "label": "Generate All"},
     ]
 
     def run(self, action, settings, **kwargs):
