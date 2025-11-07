@@ -335,8 +335,8 @@ def _cleanup(rows: List[List[str]], root: Path, apply: bool) -> None:
     def check_one(p: Path):
         try:
             data = p.read_text(encoding="utf-8", errors="ignore").strip()
-            # Proper UUID v4 format: 8-4-4-4-12 hex digits
-            m = re.search(r"/proxy/vod/(movie|episode)/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", data, flags=re.I)
+            # Extract UUID (simple pattern since we control .strm file generation)
+            m = re.search(r"/proxy/vod/(movie|episode)/([a-f0-9-]+)", data, flags=re.I)
             if not m:
                 return ("unknown", None)
             typ, uid = m.group(1).lower(), m.group(2)
