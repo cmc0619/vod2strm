@@ -11,6 +11,8 @@
 - **Main branch is protected - cannot push directly or use gh CLI to modify it**
 - Create PRs and STOP - let the user review and merge them
 - Only commit to feature branches (must use `claude/*` prefix with session ID suffix)
+- **Create separate branch/PR for each logical fix** - one issue = one branch/PR
+- This makes reviews easier and allows independent merging
 
 ## Code Review Process (Codex)
 - Codex automatically reviews every PR on initial push
