@@ -547,7 +547,6 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 # -------------------- Plugin Class --------------------
 
 class Plugin:
-    key = "vod2strm"
     name = "vod2strm"
     version = "0.0.1"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
@@ -556,7 +555,7 @@ class Plugin:
         {
             "id": "output_root",
             "label": "Output Root Folder",
-            "type": "text",
+            "type": "string",
             "default": DEFAULT_ROOT,
             "help": "Where to write STRM/NFO files (e.g., /data/STRM).",
             "required": True,
@@ -564,7 +563,7 @@ class Plugin:
         {
             "id": "base_url",
             "label": "Base URL (for .strm)",
-            "type": "text",
+            "type": "string",
             "default": DEFAULT_BASE_URL,
             "help": "e.g., http://192.168.199.10:9191",
             "required": True,
@@ -602,7 +601,7 @@ class Plugin:
         {
             "id": "schedule",
             "label": "Schedule (crontab string or 'daily HH:MM')",
-            "type": "text",
+            "type": "string",
             "default": "",
             "help": "Leave blank to disable. Example: 'daily 03:30' or '0 30 3 * * *'",
         },
@@ -615,11 +614,12 @@ class Plugin:
         {"id": "generate_all", "label": "Generate All"},
     ]
 
-    def run(self, action, settings, **kwargs):
+    def run(self, action: str, params: dict, context: dict):
         """
         Dispatcharr calls this when a button is clicked.
         We enqueue a background job (Celery if available, else a thread).
         """
+        settings = context.get("settings", {})
         _configure_file_logger(settings.get("debug_logging", False))
 
         output_root = Path(settings.get("output_root") or DEFAULT_ROOT)
