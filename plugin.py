@@ -283,21 +283,23 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]]) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock) -> None:
     m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movies/{movie.uuid}"
     wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
-    report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
+    with lock:
+        report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos:
         nfo_path = m_folder / "movie.nfo"
         nfo_bytes = _nfo_movie(movie)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
-        report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
+        with lock:
+            report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]]) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock) -> None:
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
@@ -306,20 +308,23 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     url = f"{base_url.rstrip('/')}/proxy/vod/episodes/{episode.uuid}"
     wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
     title = getattr(episode, "name", "") or ""
-    report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
+    with lock:
+        report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos:
         # season.nfo
         season_nfo_path = e_folder / "season.nfo"
         season_nfo_bytes = _nfo_season(series, season_number)
         wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
-        report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
+        with lock:
+            report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
 
         # episode nfo
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
         ep_nfo_bytes = _nfo_episode(episode)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
-        report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
+        with lock:
+            report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
 
 
 # -------------------- Cleanup --------------------
@@ -443,13 +448,15 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
+    lock = threading.Lock()
 
     def job(m: Movie) -> None:
         try:
-            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows)
+            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock)
         except Exception as e:
             LOGGER.warning("Movie id=%s failed: %s", m.id, e)
-            rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
+            with lock:
+                rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         list(ex.map(job, work))
@@ -489,6 +496,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
+    lock = threading.Lock()
 
     for s in series_qs.iterator(chunk_size=200):
         try:
@@ -503,7 +511,8 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 expected = _series_expected_count(s.id)
 
             if expected > 0 and _compare_tree_quick(series_folder, expected, write_nfos):
-                rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
+                with lock:
+                    rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
                 continue
 
             eps = list(Episode.objects.filter(series_id=s.id).only(
@@ -512,18 +521,20 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
             ).order_by("season_number", "episode_number"))
 
             if not eps:
-                rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "no_episodes"])
+                with lock:
+                    rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "no_episodes"])
                 continue
 
             def job(e: Episode) -> None:
-                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows)
+                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock)
 
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                 list(ex.map(job, eps))
 
         except Exception as e:
             LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
-            rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(getattr(s, "uuid", "")), "", "", "error", str(e)])
+            with lock:
+                rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(getattr(s, "uuid", "")), "", "", "error", str(e)])
 
 
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
