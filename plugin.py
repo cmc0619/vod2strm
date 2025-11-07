@@ -335,11 +335,12 @@ def _cleanup(rows: List[List[str]], root: Path, apply: bool) -> None:
     def check_one(p: Path):
         try:
             data = p.read_text(encoding="utf-8", errors="ignore").strip()
-            m = re.search(r"/proxy/vod/(movies|episodes)/([a-f0-9\-]{16,})", data, flags=re.I)
+            # Proper UUID v4 format: 8-4-4-4-12 hex digits
+            m = re.search(r"/proxy/vod/(movie|episode)/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", data, flags=re.I)
             if not m:
                 return ("unknown", None)
             typ, uid = m.group(1).lower(), m.group(2)
-            present = (uid in movie_uuids) if typ == "movies" else (uid in episode_uuids)
+            present = (uid in movie_uuids) if typ == "movie" else (uid in episode_uuids)
             return ("ok", (typ, uid, present))
         except Exception as e:
             return ("error", str(e))
