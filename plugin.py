@@ -464,28 +464,45 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
-    Best-effort: call an internal Celery task that refreshes/hydrates VOD episodes, if available.
-    Returns True if we *requested* a refresh (not necessarily that it finished).
+    Best-effort: call the Celery task that refreshes/hydrates VOD episodes for a series.
+    Returns True if we successfully requested a refresh.
     """
     try:
         if celery_app is None:
             LOGGER.debug("Celery app not available; skipping internal refresh.")
             return False
-        # Candidate task names (adjust if your app uses a specific one)
-        task_names = [
-            "apps.vod.tasks.refresh_series_episodes",
-            "apps.vod.tasks.refresh_vod_for_series",
-            "vod.tasks.refresh_series_episodes",
-            "vod.tasks.refresh_vod_for_series",
-            "apps.vod.tasks.refresh_vod",
-        ]
-        for tname in task_names:
-            if tname in celery_app.tasks:
-                celery_app.send_task(tname, args=[series.id], kwargs={}, queue="default")
-                LOGGER.info("Requested internal episode refresh via '%s' for series_id=%s", tname, series.id)
-                return True
-        LOGGER.debug("No known VOD refresh task registered in Celery; skipping internal refresh.")
-        return False
+
+        # Get account_id from series M3U relations
+        # A series can have multiple relations (from different accounts), pick the first active one
+        relation = series.m3u_relations.select_related('m3u_account').filter(
+            m3u_account__is_active=True
+        ).first()
+
+        if not relation:
+            LOGGER.debug("Series id=%s has no active M3U account relations; cannot refresh.", series.id)
+            return False
+
+        account_id = relation.m3u_account.id
+
+        # Call the actual registered Celery task
+        task_name = "apps.vod.tasks.batch_refresh_series_episodes"
+        if task_name in celery_app.tasks:
+            celery_app.send_task(
+                task_name,
+                args=[account_id],
+                kwargs={"series_ids": [series.id]},
+                queue="default"
+            )
+            LOGGER.info(
+                "Requested episode refresh for series_id=%s via account_id=%s",
+                series.id,
+                account_id
+            )
+            return True
+        else:
+            LOGGER.debug("Task '%s' not registered in Celery; skipping internal refresh.", task_name)
+            return False
+
     except Exception as e:  # pragma: no cover
         LOGGER.warning("Internal refresh attempt failed for series_id=%s: %s", series.id, e)
         return False
