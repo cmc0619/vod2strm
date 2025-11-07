@@ -1,5 +1,11 @@
 # Project Rules for Claude
 
+## Meta: Maintaining This File
+- **This file is your persistent memory across sessions**
+- When important context emerges during work, ADD IT HERE and commit immediately - no questions asked
+- This includes: architecture decisions, user preferences, critical bugs to avoid, workflow patterns, etc.
+- Keep it concise but comprehensive - future you depends on this
+
 ## Git & Release Management
 - **NEVER merge PRs to main without explicit user approval**
 - **Main branch is protected - cannot push directly or use gh CLI to modify it**
