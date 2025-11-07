@@ -29,7 +29,6 @@ import logging.handlers
 import os
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -464,47 +463,62 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
-    Best-effort: call the Celery task that refreshes/hydrates VOD episodes for a series.
-    Returns True if we successfully requested a refresh.
+    Refresh episodes from providers in user-configured priority order.
+    Tries each provider until one successfully returns episodes.
+    Matches the UI pattern: calls refresh_series_episodes() directly (synchronous).
     """
     try:
-        if celery_app is None:
-            LOGGER.debug("Celery app not available; skipping internal refresh.")
-            return False
+        from apps.vod.tasks import refresh_series_episodes
 
-        # Get account_id from series M3U relations
-        # A series can have multiple relations (from different accounts), pick the first active one
-        relation = series.m3u_relations.select_related('m3u_account').filter(
+        # Get all active relations, sorted by user-configured priority
+        relations = series.m3u_relations.select_related('m3u_account').filter(
             m3u_account__is_active=True
-        ).first()
+        ).order_by('-m3u_account__priority', 'id')
 
-        if not relation:
-            LOGGER.debug("Series id=%s has no active M3U account relations; cannot refresh.", series.id)
+        if not relations:
+            LOGGER.debug("Series id=%s has no active M3U account relations", series.id)
             return False
 
-        account_id = relation.m3u_account.id
-
-        # Call the actual registered Celery task
-        task_name = "apps.vod.tasks.batch_refresh_series_episodes"
-        if task_name in celery_app.tasks:
-            celery_app.send_task(
-                task_name,
-                args=[account_id],
-                kwargs={"series_ids": [series.id]},
-                queue="default"
-            )
+        # Try each provider in priority order
+        for relation in relations:
             LOGGER.info(
-                "Requested episode refresh for series_id=%s via account_id=%s",
+                "Attempting episode refresh for series_id=%s from provider %s (priority %s)",
                 series.id,
-                account_id
+                relation.m3u_account.name,
+                relation.m3u_account.priority
             )
-            return True
-        else:
-            LOGGER.debug("Task '%s' not registered in Celery; skipping internal refresh.", task_name)
-            return False
+
+            # Call refresh directly (synchronous, matching UI pattern in apps/vod/api_views.py:356)
+            refresh_series_episodes(
+                relation.m3u_account,
+                series,
+                relation.external_series_id
+            )
+
+            # Check if we got episodes
+            episode_count = Episode.objects.filter(series_id=series.id).count()
+            if episode_count > 0:
+                LOGGER.info(
+                    "Successfully fetched %d episodes from provider %s",
+                    episode_count,
+                    relation.m3u_account.name
+                )
+                return True
+
+            LOGGER.warning(
+                "Provider %s did not return episodes, trying next provider",
+                relation.m3u_account.name
+            )
+
+        LOGGER.warning(
+            "No provider returned episodes for series_id=%s after trying %d provider(s)",
+            series.id,
+            relations.count()
+        )
+        return False
 
     except Exception as e:  # pragma: no cover
-        LOGGER.warning("Internal refresh attempt failed for series_id=%s: %s", series.id, e)
+        LOGGER.warning("Episode refresh failed for series_id=%s: %s", series.id, e)
         return False
 
 
@@ -521,11 +535,13 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
             expected = _series_expected_count(s.id)
 
             if expected == 0:
-                LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh then retry.", s.id)
-                requested = _maybe_internal_refresh_series(s)
-                if requested:
-                    time.sleep(2.0)
-                expected = _series_expected_count(s.id)
+                LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh.", s.id)
+                refreshed = _maybe_internal_refresh_series(s)
+                if refreshed:
+                    # Episodes were fetched, recount (no sleep needed - synchronous call)
+                    expected = _series_expected_count(s.id)
+                else:
+                    LOGGER.debug("Could not fetch episodes for series id=%s; skipping.", s.id)
 
             if expected > 0 and _compare_tree_quick(series_folder, expected, write_nfos):
                 with lock:
