@@ -740,13 +740,24 @@ if celery_app:
 
     @celery_app.task(name="plugins.vod2strm.tasks.generate_all")
     def celery_generate_all():
-        # Fallback scheduled task using defaults if your framework doesn't inject settings here.
+        # Load settings from database for scheduled task
+        try:
+            from apps.plugins.models import PluginConfig
+            plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+            if plugin_config and plugin_config.settings:
+                settings = plugin_config.settings
+            else:
+                settings = {}
+        except Exception as e:
+            LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
+            settings = {}
+
         _run_job_sync(
             mode="all",
-            output_root=DEFAULT_ROOT,
-            base_url=DEFAULT_BASE_URL,
-            write_nfos=True,
-            cleanup_mode=CLEANUP_OFF,
-            concurrency=12,
-            debug_logging=False,
+            output_root=settings.get("output_root") or DEFAULT_ROOT,
+            base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+            write_nfos=bool(settings.get("write_nfos", True)),
+            cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+            concurrency=int(settings.get("concurrency") or 12),
+            debug_logging=bool(settings.get("debug_logging", False)),
         )
