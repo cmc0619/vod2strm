@@ -29,6 +29,9 @@
 - If you don't have a token (e.g., after context reset), ask the user for it
 - Use curl with GitHub API for PR operations (gh CLI doesn't work with protected main)
 
+## Future Features (Backlog)
+- **Incremental episode updates with caching**: Instead of full refresh, fetch provider episode list and only add missing episodes. User has another version of this plugin with this implemented - can steal ideas from it later.
+
 ---
 
 **Note:** This is a living document. Important project-specific rules and context will be added here as they emerge.
