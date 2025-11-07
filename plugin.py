@@ -195,6 +195,7 @@ def _nfo_movie(m: Movie) -> bytes:
         "uniqueid_imdb": str(getattr(m, "imdb_id", "") or ""),
     }
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8"?>\n')
     xml.write("<movie>\n")
     for tag, val in fields.items():
         if val:
@@ -212,6 +213,7 @@ def _nfo_movie(m: Movie) -> bytes:
 
 def _nfo_season(s: Series, season_number: int) -> bytes:
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8"?>\n')
     xml.write("<season>\n")
     xml.write(f"  <seasonnumber>{season_number}</seasonnumber>\n")
     name = s.name or ""
@@ -233,6 +235,7 @@ def _nfo_episode(e: Episode) -> bytes:
         "uniqueid_imdb": str(getattr(e, "imdb_id", "") or ""),
     }
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8"?>\n')
     xml.write("<episodedetails>\n")
     for tag, val in fields.items():
         if val:
