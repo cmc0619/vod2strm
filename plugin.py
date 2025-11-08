@@ -143,6 +143,84 @@ def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
         LOGGER.warning("Failed to save manifest to %s: %s", manifest_path, e)
 
 
+# -------------------- Adaptive Throttle --------------------
+
+class AdaptiveThrottle:
+    """
+    Monitors write performance and adjusts concurrency dynamically.
+
+    Strategy:
+    - Track average write latency over rolling window
+    - If writes are slow (>200ms), reduce workers
+    - If writes are fast (<50ms), increase workers
+    - Bounds: min=1, max=user_setting
+    """
+
+    def __init__(self, max_workers: int, enabled: bool = True):
+        self.max_workers = max_workers
+        self.enabled = enabled
+        self.current_workers = max_workers
+        self.write_times = []  # Rolling window of last N write times
+        self.window_size = 50  # Track last 50 writes
+        self.lock = threading.Lock()
+
+        # Thresholds (in seconds)
+        self.slow_threshold = 0.200  # 200ms
+        self.fast_threshold = 0.050  # 50ms
+
+        # Adjustment rates
+        self.scale_down_factor = 0.75  # Reduce by 25% when slow
+        self.scale_up_factor = 1.25    # Increase by 25% when fast
+
+        # Check interval - adjust every N writes
+        self.check_interval = 50
+        self.writes_since_check = 0
+
+    def record_write(self, write_time: float) -> None:
+        """Record a write operation's duration."""
+        if not self.enabled:
+            return
+
+        with self.lock:
+            self.write_times.append(write_time)
+            if len(self.write_times) > self.window_size:
+                self.write_times.pop(0)
+
+            self.writes_since_check += 1
+            if self.writes_since_check >= self.check_interval:
+                self._adjust_concurrency()
+                self.writes_since_check = 0
+
+    def _adjust_concurrency(self) -> None:
+        """Adjust concurrency based on average write time."""
+        if not self.write_times:
+            return
+
+        avg_write_time = sum(self.write_times) / len(self.write_times)
+        old_workers = self.current_workers
+
+        if avg_write_time > self.slow_threshold:
+            # NAS is slow, reduce workers
+            self.current_workers = max(1, int(self.current_workers * self.scale_down_factor))
+            LOGGER.info(
+                "Adaptive throttle: NAS slow (avg %.3fs), reducing workers %d → %d",
+                avg_write_time, old_workers, self.current_workers
+            )
+        elif avg_write_time < self.fast_threshold and self.current_workers < self.max_workers:
+            # NAS is fast, increase workers
+            self.current_workers = min(self.max_workers, int(self.current_workers * self.scale_up_factor))
+            if self.current_workers != old_workers:
+                LOGGER.info(
+                    "Adaptive throttle: NAS fast (avg %.3fs), increasing workers %d → %d",
+                    avg_write_time, old_workers, self.current_workers
+                )
+
+    def get_workers(self) -> int:
+        """Get current worker count."""
+        with self.lock:
+            return self.current_workers if self.enabled else self.max_workers
+
+
 # -------------------- Small helpers --------------------
 
 def _ts() -> str:
@@ -354,11 +432,17 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
     m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
+
+    # Time the write operation for adaptive throttling
+    start_time = time.time()
     wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie", dry_run)
+    if wrote and throttle:
+        throttle.record_write(time.time() - start_time)
+
     with lock:
         report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
@@ -370,14 +454,20 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
+
+    # Time the write operation for adaptive throttling
+    start_time = time.time()
     wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode", dry_run)
+    if wrote and throttle:
+        throttle.record_write(time.time() - start_time)
+
     title = getattr(episode, "name", "") or ""
     with lock:
         report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
@@ -486,10 +576,11 @@ def _run_job_sync(
     concurrency: int,
     debug_logging: bool = False,
     dry_run: bool = False,
+    adaptive_throttle: bool = True,
 ) -> None:
     _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s",
+                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
 
     root = Path(output_root)
     ts = _ts()
@@ -499,10 +590,10 @@ def _run_job_sync(
 
     try:
         if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run)
+            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
 
         if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run)
+            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
@@ -520,8 +611,8 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False) -> None:
-    LOGGER.info("Scanning movies... (dry_run=%s)", dry_run)
+def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
+    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
@@ -529,17 +620,27 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Load manifest for caching
     manifest = _load_manifest(root)
     lock = threading.Lock()
+    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
-    def job(m: Movie) -> None:
-        try:
-            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run)
-        except Exception as e:
-            LOGGER.warning("Movie id=%s failed: %s", m.id, e)
-            with lock:
-                rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
+    # Process in batches to allow adaptive concurrency adjustments
+    batch_size = 100
+    for i in range(0, len(work), batch_size):
+        batch = work[i:i + batch_size]
+        current_workers = throttle.get_workers()
 
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-        list(ex.map(job, work))
+        def job(m: Movie) -> None:
+            try:
+                _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle)
+            except Exception as e:
+                LOGGER.warning("Movie id=%s failed: %s", m.id, e)
+                with lock:
+                    rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
+
+        with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
+            list(ex.map(job, batch))
+
+        # Log progress every batch
+        LOGGER.info("Movies: processed %d / %d (current workers: %d)", min(i + batch_size, len(work)), len(work), current_workers)
 
     # Save manifest after all writes (skip in dry run)
     if not dry_run:
@@ -617,8 +718,8 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
         return False
 
 
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False) -> None:
-    LOGGER.info("Scanning series... (dry_run=%s)", dry_run)
+def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
+    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
@@ -626,6 +727,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Load manifest for caching
     manifest = _load_manifest(root)
     lock = threading.Lock()
+    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
     for s in series_qs.iterator(chunk_size=200):
         try:
@@ -656,11 +758,17 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "no_episodes"])
                 continue
 
-            def job(e: Episode) -> None:
-                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run)
+            # Process episodes in batches with adaptive concurrency
+            batch_size = 100
+            for i in range(0, len(eps), batch_size):
+                batch = eps[i:i + batch_size]
+                current_workers = throttle.get_workers()
 
-            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-                list(ex.map(job, eps))
+                def job(e: Episode) -> None:
+                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle)
+
+                with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
+                    list(ex.map(job, batch))
 
         except Exception as e:
             LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
@@ -825,10 +933,17 @@ class Plugin:
         },
         {
             "id": "concurrency",
-            "label": "Filesystem concurrency",
+            "label": "Max Filesystem Concurrency",
             "type": "number",
-            "default": 12,
-            "help": "Number of concurrent file operations.",
+            "default": 4,
+            "help": "Maximum concurrent file operations (adaptive throttling will adjust based on NAS performance). Lower values protect slower storage.",
+        },
+        {
+            "id": "adaptive_throttle",
+            "label": "Adaptive Throttling",
+            "type": "boolean",
+            "default": True,
+            "help": "Automatically reduce concurrency when NAS is slow, increase when fast. Protects against I/O overload.",
         },
         {
             "id": "debug_logging",
@@ -872,11 +987,12 @@ class Plugin:
         base_url = settings.get("base_url") or DEFAULT_BASE_URL
         write_nfos = bool(settings.get("write_nfos", True))
         cleanup_mode = settings.get("cleanup_mode", CLEANUP_OFF)
-        concurrency = int(settings.get("concurrency") or 12)
+        concurrency = int(settings.get("concurrency") or 4)
         dry_run = bool(settings.get("dry_run", False))
+        adaptive_throttle = bool(settings.get("adaptive_throttle", True))
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s",
+                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
 
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
@@ -891,18 +1007,18 @@ class Plugin:
                 return {"status": "error", "message": f"Failed to generate stats: {e}"}
 
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
             return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
             msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
             msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
             msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
             return {"status": "ok", "message": msg}
 
@@ -956,7 +1072,7 @@ class Plugin:
         except Exception as e:  # pragma: no cover
             LOGGER.warning("Failed to register schedule: %s", e)
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True):
         args = {
             "mode": mode,
             "output_root": str(output_root),
@@ -966,12 +1082,13 @@ class Plugin:
             "concurrency": concurrency,
             "debug_logging": LOGGER.level <= logging.DEBUG,
             "dry_run": dry_run,
+            "adaptive_throttle": adaptive_throttle,
         }
 
         # Prefer Celery if our task is registered
         if celery_app and "plugins.vod2strm.tasks.run_job" in celery_app.tasks:
             celery_app.send_task("plugins.vod2strm.tasks.run_job", args=[args], queue="default")
-            LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s)", mode, dry_run)
+            LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
             return
 
         # Fallback to background thread
@@ -1007,7 +1124,8 @@ if celery_app:
             base_url=settings.get("base_url") or DEFAULT_BASE_URL,
             write_nfos=bool(settings.get("write_nfos", True)),
             cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-            concurrency=int(settings.get("concurrency") or 12),
+            concurrency=int(settings.get("concurrency") or 4),
             debug_logging=bool(settings.get("debug_logging", False)),
             dry_run=False,  # Scheduled runs always run for real
+            adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
         )
