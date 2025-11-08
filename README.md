@@ -158,8 +158,8 @@ Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
 ## Versioning
 
 Semantic versioning: `MAJOR.MINOR.PATCH`
-- Current: `0.0.1`
-- Increments: `0.0.2`, `0.0.3`, etc.
+- Current: `0.0.2`
+- Increments: `0.0.3`, `0.0.4`, etc.
 
 ## License
 

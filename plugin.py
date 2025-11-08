@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.1
+Version: 0.0.2
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -9,7 +9,7 @@ Spec:
   * Movies -> <root>/Movies/{Name} ({Year})/{Name} ({Year}).strm
   * Series -> <root>/TV/{SeriesName (Year) or SeriesName + (year)}/Season {SS or 00}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
-  * .strm contents use {base_url}/proxy/vod/(movies|episodes)/{uuid}
+  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}
 - NFO generation (compare-before-write):
   * Movies: movie.nfo in movie folder
   * Seasons: season.nfo per season folder
@@ -925,7 +925,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.1"
+    version = "0.0.2"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
