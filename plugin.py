@@ -946,6 +946,13 @@ class Plugin:
             "help": "Automatically reduce concurrency when NAS is slow, increase when fast. Protects against I/O overload.",
         },
         {
+            "id": "auto_run_after_vod_refresh",
+            "label": "Auto-run after VOD Refresh",
+            "type": "boolean",
+            "default": False,
+            "help": "Automatically generate .strm files after Dispatcharr refreshes VOD content from providers. Uses 30-second debounce to batch multiple refreshes.",
+        },
+        {
             "id": "debug_logging",
             "label": "Robust debug logging",
             "type": "boolean",
@@ -1129,3 +1136,83 @@ if celery_app:
             dry_run=False,  # Scheduled runs always run for real
             adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
         )
+
+
+# -------------------- Auto-run after VOD refresh --------------------
+
+# Debounce state for auto-run
+_auto_run_debounce_timer = None
+_auto_run_lock = threading.Lock()
+
+
+def _schedule_auto_run_after_vod_refresh():
+    """
+    Schedule an auto-run with 30-second debounce.
+    Multiple VOD refreshes within 30 seconds will only trigger one generation.
+    """
+    global _auto_run_debounce_timer
+
+    # Load settings to check if auto-run is enabled
+    try:
+        from apps.plugins.models import PluginConfig
+        plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+        if not plugin_config or not plugin_config.settings:
+            return
+
+        settings = plugin_config.settings
+        if not settings.get("auto_run_after_vod_refresh", False):
+            return  # Feature disabled
+
+        with _auto_run_lock:
+            # Cancel existing timer
+            if _auto_run_debounce_timer:
+                _auto_run_debounce_timer.cancel()
+
+            # Schedule new run in 30 seconds
+            def run_generation():
+                LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
+                _run_job_sync(
+                    mode="all",
+                    output_root=settings.get("output_root") or DEFAULT_ROOT,
+                    base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+                    write_nfos=bool(settings.get("write_nfos", True)),
+                    cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+                    concurrency=int(settings.get("concurrency") or 4),
+                    debug_logging=bool(settings.get("debug_logging", False)),
+                    dry_run=False,
+                    adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                )
+
+            _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
+            _auto_run_debounce_timer.daemon = True
+            _auto_run_debounce_timer.start()
+            LOGGER.debug("Auto-run scheduled in 30 seconds (debounced)")
+
+    except Exception as e:
+        LOGGER.warning("Failed to schedule auto-run after VOD refresh: %s", e)
+
+
+# Register signal listeners for VOD content updates
+try:
+    from django.db.models.signals import post_save, post_delete
+    from django.dispatch import receiver
+
+    # Listen for Episode creation/updates (bulk_created signal doesn't fire for all cases)
+    @receiver(post_save, sender=Episode)
+    def on_episode_saved(sender, instance, created, **kwargs):
+        """Trigger auto-run when episodes are created/updated"""
+        if created:  # Only on new episodes
+            _schedule_auto_run_after_vod_refresh()
+
+    @receiver(post_save, sender=Movie)
+    def on_movie_saved(sender, instance, created, **kwargs):
+        """Trigger auto-run when movies are created/updated"""
+        if created:  # Only on new movies
+            _schedule_auto_run_after_vod_refresh()
+
+    LOGGER.info("VOD refresh signal handlers registered")
+
+except ImportError:
+    LOGGER.warning("Could not register VOD refresh signal handlers (Django signals not available)")
+except Exception as e:
+    LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
