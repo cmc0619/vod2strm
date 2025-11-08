@@ -205,13 +205,13 @@ def _write_if_changed(path: Path, content: bytes) -> Tuple[bool, str]:
     return (True, "created" if existing is None else "updated")
 
 
-def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str) -> Tuple[bool, str]:
+def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str, dry_run: bool = False) -> Tuple[bool, str]:
     """
     Write .strm file only if UUID changed or file doesn't exist in manifest.
     Checks manifest first to avoid disk reads when possible.
 
     Returns (written, reason)
-    reason ∈ {"created", "updated", "cached_skip"}
+    reason ∈ {"created", "updated", "cached_skip", "dry_run"}
     """
     path_str = str(path)
     manifest_files = manifest.get("files", {})
@@ -223,7 +223,13 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
             # UUID hasn't changed, skip write (and skip read!)
             return (False, "cached_skip")
 
-    # UUID changed or not in manifest - need to write
+    # UUID changed or not in manifest
+    if dry_run:
+        # Don't write, but report what would happen
+        is_new = path_str not in manifest_files
+        return (False, f"dry_run_{'create' if is_new else 'update'}")
+
+    # Write for real
     content = (url + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
@@ -348,15 +354,15 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any]) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False) -> None:
     m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
-    wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie")
+    wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie", dry_run)
     with lock:
         report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
-    if write_nfos:
+    if write_nfos and not dry_run:
         nfo_path = m_folder / "movie.nfo"
         nfo_bytes = _nfo_movie(movie)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
@@ -364,19 +370,19 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any]) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False) -> None:
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
-    wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode")
+    wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode", dry_run)
     title = getattr(episode, "name", "") or ""
     with lock:
         report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
-    if write_nfos:
+    if write_nfos and not dry_run:
         # season.nfo
         season_nfo_path = e_folder / "season.nfo"
         season_nfo_bytes = _nfo_season(series, season_number)
@@ -479,10 +485,11 @@ def _run_job_sync(
     cleanup_mode: str,
     concurrency: int,
     debug_logging: bool = False,
+    dry_run: bool = False,
 ) -> None:
     _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency)
+    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s",
+                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
 
     root = Path(output_root)
     ts = _ts()
@@ -492,16 +499,18 @@ def _run_job_sync(
 
     try:
         if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency)
+            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run)
 
         if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency)
+            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run)
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
 
         if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
-            _cleanup(rows, root, apply=(cleanup_mode == CLEANUP_APPLY))
+            # Skip cleanup in dry run mode
+            if not dry_run:
+                _cleanup(rows, root, apply=(cleanup_mode == CLEANUP_APPLY))
 
     except Exception as e:  # pragma: no cover
         LOGGER.exception("Job failed: %s", e)
@@ -511,8 +520,8 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int) -> None:
-    LOGGER.info("Scanning movies...")
+def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False) -> None:
+    LOGGER.info("Scanning movies... (dry_run=%s)", dry_run)
     qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
@@ -523,7 +532,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
     def job(m: Movie) -> None:
         try:
-            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest)
+            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run)
         except Exception as e:
             LOGGER.warning("Movie id=%s failed: %s", m.id, e)
             with lock:
@@ -532,42 +541,84 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         list(ex.map(job, work))
 
-    # Save manifest after all writes
-    _save_manifest(root, manifest)
-    LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
+    # Save manifest after all writes (skip in dry run)
+    if not dry_run:
+        _save_manifest(root, manifest)
+        LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
 
 
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
-    Best-effort: call an internal Celery task that refreshes/hydrates VOD episodes, if available.
-    Returns True if we *requested* a refresh (not necessarily that it finished).
+    Refresh episodes from providers in user-configured priority order.
+    Tries each provider until one successfully returns episodes.
+    Calls refresh_series_episodes() directly (synchronous, matching Dispatcharr UI pattern).
+
+    Returns True if episodes were successfully fetched.
     """
     try:
-        if celery_app is None:
-            LOGGER.debug("Celery app not available; skipping internal refresh.")
+        from apps.vod.tasks import refresh_series_episodes
+    except ImportError:
+        try:
+            from vod.tasks import refresh_series_episodes
+        except ImportError:
+            LOGGER.debug("Could not import refresh_series_episodes; skipping internal refresh.")
             return False
-        # Candidate task names (adjust if your app uses a specific one)
-        task_names = [
-            "apps.vod.tasks.refresh_series_episodes",
-            "apps.vod.tasks.refresh_vod_for_series",
-            "vod.tasks.refresh_series_episodes",
-            "vod.tasks.refresh_vod_for_series",
-            "apps.vod.tasks.refresh_vod",
-        ]
-        for tname in task_names:
-            if tname in celery_app.tasks:
-                celery_app.send_task(tname, args=[series.id], kwargs={}, queue="default")
-                LOGGER.info("Requested internal episode refresh via '%s' for series_id=%s", tname, series.id)
+
+    try:
+        # Get all active relations, sorted by user-configured priority
+        relations = series.m3u_relations.select_related('m3u_account').filter(
+            m3u_account__is_active=True
+        ).order_by('-m3u_account__priority', 'id')
+
+        if not relations:
+            LOGGER.debug("Series id=%s has no active M3U account relations", series.id)
+            return False
+
+        # Try each provider in priority order
+        for relation in relations:
+            LOGGER.info(
+                "Attempting episode refresh for series_id=%s from provider %s (priority %s)",
+                series.id,
+                relation.m3u_account.name,
+                relation.m3u_account.priority
+            )
+
+            # Call refresh directly (synchronous, matching UI pattern)
+            refresh_series_episodes(
+                relation.m3u_account,
+                series,
+                relation.external_series_id
+            )
+
+            # Check if we got episodes
+            episode_count = Episode.objects.filter(series_id=series.id).count()
+            if episode_count > 0:
+                LOGGER.info(
+                    "Successfully fetched %d episodes from provider %s",
+                    episode_count,
+                    relation.m3u_account.name
+                )
                 return True
-        LOGGER.debug("No known VOD refresh task registered in Celery; skipping internal refresh.")
+
+            LOGGER.warning(
+                "Provider %s did not return episodes, trying next provider",
+                relation.m3u_account.name
+            )
+
+        LOGGER.warning(
+            "No provider returned episodes for series_id=%s after trying %d provider(s)",
+            series.id,
+            relations.count()
+        )
         return False
+
     except Exception as e:  # pragma: no cover
-        LOGGER.warning("Internal refresh attempt failed for series_id=%s: %s", series.id, e)
+        LOGGER.warning("Episode refresh failed for series_id=%s: %s", series.id, e)
         return False
 
 
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int) -> None:
-    LOGGER.info("Scanning series...")
+def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False) -> None:
+    LOGGER.info("Scanning series... (dry_run=%s)", dry_run)
     series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
@@ -582,11 +633,13 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
             expected = _series_expected_count(s.id)
 
             if expected == 0:
-                LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh then retry.", s.id)
-                requested = _maybe_internal_refresh_series(s)
-                if requested:
-                    time.sleep(2.0)
-                expected = _series_expected_count(s.id)
+                LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh.", s.id)
+                refreshed = _maybe_internal_refresh_series(s)
+                if refreshed:
+                    # Episodes were fetched, recount (no sleep needed - synchronous call)
+                    expected = _series_expected_count(s.id)
+                else:
+                    LOGGER.debug("Could not fetch episodes for series id=%s; skipping.", s.id)
 
             if expected > 0 and _compare_tree_quick(series_folder, expected, write_nfos):
                 with lock:
@@ -604,7 +657,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 continue
 
             def job(e: Episode) -> None:
-                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest)
+                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run)
 
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                 list(ex.map(job, eps))
@@ -614,9 +667,101 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
             with lock:
                 rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(getattr(s, "uuid", "")), "", "", "error", str(e)])
 
-    # Save manifest after all writes
-    _save_manifest(root, manifest)
-    LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
+    # Save manifest after all writes (skip in dry run)
+    if not dry_run:
+        _save_manifest(root, manifest)
+        LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
+
+
+def _db_stats() -> str:
+    """
+    Generate database statistics report showing content counts and relationships.
+    Returns formatted string suitable for display in Dispatcharr UI.
+    """
+    from django.db import connection
+
+    stats = []
+    stats.append("=== DATABASE STATISTICS ===\n")
+
+    # Basic counts
+    movies = Movie.objects.count()
+    series = Series.objects.count()
+    episodes = Episode.objects.count()
+
+    stats.append(f"CONTENT COUNTS:")
+    stats.append(f"  Movies: {movies}")
+    stats.append(f"  Series: {series}")
+    stats.append(f"  Episodes: {episodes}\n")
+
+    # M3U account stats
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT ma.id, ma.name, ma.priority, ma.is_active
+                FROM m3u_m3uaccount ma
+                ORDER BY ma.priority DESC, ma.name
+            """)
+            providers = cursor.fetchall()
+
+            if providers:
+                stats.append("M3U PROVIDERS:")
+                for provider_id, name, priority, is_active in providers:
+                    status = "✓" if is_active else "✗"
+                    stats.append(f"  {status} ID {provider_id}: {name} (priority: {priority})")
+                stats.append("")
+
+            # Movies per provider
+            cursor.execute("""
+                SELECT ma.name, ma.id, COUNT(DISTINCT m.id) as count
+                FROM vod_movie m
+                INNER JOIN vod_m3umovierelation mr ON m.id = mr.movie_id
+                INNER JOIN m3u_m3uaccount ma ON mr.m3u_account_id = ma.id
+                GROUP BY ma.name, ma.id
+                ORDER BY count DESC
+            """)
+            movie_counts = cursor.fetchall()
+
+            if movie_counts:
+                stats.append("MOVIES BY PROVIDER:")
+                for name, provider_id, count in movie_counts:
+                    stats.append(f"  {name} (ID {provider_id}): {count} movies")
+                stats.append("")
+
+            # Series per provider
+            cursor.execute("""
+                SELECT ma.name, ma.id, COUNT(DISTINCT s.id) as count
+                FROM vod_series s
+                INNER JOIN vod_m3useriesrelation sr ON s.id = sr.series_id
+                INNER JOIN m3u_m3uaccount ma ON sr.m3u_account_id = ma.id
+                GROUP BY ma.name, ma.id
+                ORDER BY count DESC
+            """)
+            series_counts = cursor.fetchall()
+
+            if series_counts:
+                stats.append("SERIES BY PROVIDER:")
+                for name, provider_id, count in series_counts:
+                    stats.append(f"  {name} (ID {provider_id}): {count} series")
+                stats.append("")
+
+            # Series without episodes
+            cursor.execute("""
+                SELECT COUNT(DISTINCT s.id)
+                FROM vod_series s
+                LEFT JOIN vod_episode e ON s.id = e.series_id
+                WHERE e.id IS NULL
+            """)
+            no_episodes = cursor.fetchone()[0]
+
+            if no_episodes > 0:
+                stats.append(f"WARNINGS:")
+                stats.append(f"  Series without episodes: {no_episodes}")
+                stats.append("")
+
+    except Exception as e:
+        stats.append(f"\nError querying database: {e}")
+
+    return "\n".join(stats)
 
 
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
@@ -692,6 +837,13 @@ class Plugin:
             "default": False,
         },
         {
+            "id": "dry_run",
+            "label": "Dry Run (simulate without writing)",
+            "type": "boolean",
+            "default": False,
+            "help": "Simulate generation without creating/modifying files. Useful for testing. Scheduled runs ignore this and always run for real.",
+        },
+        {
             "id": "schedule",
             "label": "Schedule (crontab string or 'daily HH:MM')",
             "type": "string",
@@ -701,6 +853,7 @@ class Plugin:
     ]
 
     actions = [
+        {"id": "db_stats", "label": "Database Statistics"},
         {"id": "stats", "label": "Stats (CSV)"},
         {"id": "generate_movies", "label": "Generate Movies"},
         {"id": "generate_series", "label": "Generate Series"},
@@ -720,25 +873,38 @@ class Plugin:
         write_nfos = bool(settings.get("write_nfos", True))
         cleanup_mode = settings.get("cleanup_mode", CLEANUP_OFF)
         concurrency = int(settings.get("concurrency") or 12)
+        dry_run = bool(settings.get("dry_run", False))
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency)
+        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s",
+                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
 
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
 
+        if action == "db_stats":
+            # Database statistics - run synchronously, return immediately
+            try:
+                stats_text = _db_stats()
+                return {"status": "ok", "message": stats_text}
+            except Exception as e:
+                LOGGER.exception("Database statistics failed")
+                return {"status": "error", "message": f"Failed to generate stats: {e}"}
+
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency)
+            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
             return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency)
-            return {"status": "ok", "message": "Generate Movies job queued."}
+            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
+            return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency)
-            return {"status": "ok", "message": "Generate Series job queued."}
+            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
+            return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency)
-            return {"status": "ok", "message": "Generate All job queued."}
+            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run)
+            msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
+            return {"status": "ok", "message": msg}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -790,7 +956,7 @@ class Plugin:
         except Exception as e:  # pragma: no cover
             LOGGER.warning("Failed to register schedule: %s", e)
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False):
         args = {
             "mode": mode,
             "output_root": str(output_root),
@@ -799,12 +965,13 @@ class Plugin:
             "cleanup_mode": cleanup_mode,
             "concurrency": concurrency,
             "debug_logging": LOGGER.level <= logging.DEBUG,
+            "dry_run": dry_run,
         }
 
         # Prefer Celery if our task is registered
         if celery_app and "plugins.vod2strm.tasks.run_job" in celery_app.tasks:
             celery_app.send_task("plugins.vod2strm.tasks.run_job", args=[args], queue="default")
-            LOGGER.info("Enqueued Celery task run_job(mode=%s)", mode)
+            LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s)", mode, dry_run)
             return
 
         # Fallback to background thread
@@ -842,4 +1009,5 @@ if celery_app:
             cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
             concurrency=int(settings.get("concurrency") or 12),
             debug_logging=bool(settings.get("debug_logging", False)),
+            dry_run=False,  # Scheduled runs always run for real
         )
