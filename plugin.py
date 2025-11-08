@@ -159,9 +159,10 @@ class AdaptiveThrottle:
     """
 
     def __init__(self, max_workers: int, enabled: bool = True):
-        self.max_workers = max_workers
+        # Hard cap at 8 to prevent DB connection exhaustion (Django creates 1 conn per thread)
+        self.max_workers = min(max_workers, 8)
         self.enabled = enabled
-        self.current_workers = max_workers
+        self.current_workers = self.max_workers
         self.write_times = []  # Rolling window of last N write times
         self.window_size = 50  # Track last 50 writes
         self.lock = threading.Lock()
@@ -764,7 +765,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
     series_qs = Series.objects.filter(
         m3u_relations__m3u_account__is_active=True
-    ).annotate(episode_count=Count('episode', distinct=True)).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).annotate(episode_count=Count('episodes', distinct=True)).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
