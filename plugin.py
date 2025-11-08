@@ -298,8 +298,12 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     if path_str in manifest_files:
         cached_entry = manifest_files[path_str]
         if cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type:
-            # UUID hasn't changed, skip write (and skip read!)
-            return (False, "cached_skip")
+            # Verify file still exists before trusting cache
+            if path.exists():
+                # UUID hasn't changed and file exists, skip write (and skip read!)
+                return (False, "cached_skip")
+            # Manifest is stale - file was deleted/corrupted
+            LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
 
     # UUID changed or not in manifest
     if dry_run:
