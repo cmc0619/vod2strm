@@ -617,7 +617,10 @@ def _run_job_sync(
 
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
-    qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    # Only generate .strm files for movies with active provider relations
+    qs = Movie.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
 
@@ -724,7 +727,10 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
 
 def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
-    series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    # Only generate .strm files for series with active provider relations
+    series_qs = Series.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
@@ -752,7 +758,11 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
                 continue
 
-            eps = list(Episode.objects.filter(series_id=s.id).only(
+            # Only generate episodes that have active provider relations
+            eps = list(Episode.objects.filter(
+                series_id=s.id,
+                m3u_relations__m3u_account__is_active=True
+            ).distinct().only(
                 "id", "uuid", "name", "season_number", "episode_number",
                 "air_date", "description", "rating", "tmdb_id", "imdb_id"
             ).order_by("season_number", "episode_number"))
@@ -986,12 +996,21 @@ class Plugin:
         {"id": "generate_all", "label": "Generate All"},
     ]
 
-    def run(self, action: str, params: dict, context: dict):
+    def run(self, action_id, params, context):
         """
         Dispatcharr calls this when a button is clicked.
         We enqueue a background job (Celery if available, else a thread).
+
+        Args:
+            action_id: The action being run (e.g., "generate_movies")
+            params: Parameters from the UI (usually empty dict)
+            context: Dict with "settings", "logger", and "actions"
         """
+        # Extract settings from context (new plugin API)
         settings = context.get("settings", {})
+        action = action_id  # Keep same variable name for compatibility
+
+
         _configure_file_logger(settings.get("debug_logging", False))
 
         output_root = Path(settings.get("output_root") or DEFAULT_ROOT)
@@ -1109,8 +1128,8 @@ class Plugin:
 
 
 # -------------------- Celery task registration --------------------
-
-if celery_app:
+# TEMP: Disabled for testing without Celery workers - remove to re-enable
+if False and celery_app:
     @celery_app.task(name="plugins.vod2strm.tasks.run_job")
     def celery_run_job(args: dict):
         _run_job_sync(**args)
