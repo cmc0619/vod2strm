@@ -458,7 +458,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None) -> None:
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
@@ -477,12 +477,25 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
-        # season.nfo
-        season_nfo_path = e_folder / "season.nfo"
-        season_nfo_bytes = _nfo_season(series, season_number)
-        wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
-        with lock:
-            report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
+        # season.nfo (only write once per season)
+        season_key = (series.id, season_number)
+        should_write_season = False
+
+        if written_seasons is not None:
+            with lock:
+                if season_key not in written_seasons:
+                    written_seasons.add(season_key)
+                    should_write_season = True
+        else:
+            # Fallback if no set provided (shouldn't happen)
+            should_write_season = True
+
+        if should_write_season:
+            season_nfo_path = e_folder / "season.nfo"
+            season_nfo_bytes = _nfo_season(series, season_number)
+            wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
+            with lock:
+                report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
 
         # episode nfo
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
@@ -737,6 +750,10 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Load manifest for caching
     manifest = _load_manifest(root)
     lock = threading.Lock()
+
+    # Track written seasons to avoid duplicate season.nfo writes
+    written_seasons = set()
+
     throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
     for s in series_qs.iterator(chunk_size=200):
@@ -779,7 +796,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 current_workers = throttle.get_workers()
 
                 def job(e: Episode) -> None:
-                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle)
+                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, written_seasons)
 
                 with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
                     list(ex.map(job, batch))
