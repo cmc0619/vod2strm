@@ -70,10 +70,28 @@
    - NOT incremental API calls (provider API returns full list anyway)
    - Our plugin just needs to periodically check provider for new episodes
 
-**Bonus optimization from vodstrmpg**:
-- Batched TMDB season fetching: `_tmdb_fetch_season_map(series_id, season_num)`
-- Fetches entire season once instead of per-episode HTTP calls
-- Cached with key: `season:{series}:{season}` in manifest
+**Bonus optimizations from vodstrmpg** (reference implementation):
+- **Direct PostgreSQL access**: Bypasses API pagination, queries Dispatcharr DB directly with psycopg2
+  - Much faster than paginating API with 100 items/page
+  - Uses `psycopg2.extras.RealDictCursor` for dict results
+  - DB credentials: host=localhost, port=5432, dbname=dispatcharr, user=dispatch
+- **Provider deduplication**: When same content exists on multiple providers (same TMDB ID):
+  - Groups by TMDB ID, picks highest-ranked provider based on user setting
+  - Example: "Provider Priority" field = "1,3,2" (comma-separated M3U account IDs)
+  - Logs deduplication: `[DEDUP] Movie 'Foo' (TMDB:123) from 3 providers [A,B,C] - using A`
+- **Database statistics action**: Shows provider IDs/names, content counts, duplicates
+  - Helps users configure provider ranking
+  - Shows imported vs total content (imported = has active M3U relation)
+- **Shared HTTP session with retries**: Uses `requests.Session` with `urllib3.Retry`
+  - Retry policy: 3 attempts, backoff 0.3s, status codes (429, 500, 502, 503, 504)
+  - Persistent connections, custom User-Agent
+- **Batched TMDB season fetching**: `_tmdb_fetch_season_map(series_id, season_num)`
+  - Fetches entire season once instead of per-episode HTTP calls
+  - Cached with key: `season:{series}:{season}` in manifest
+- **Background thread scheduler**: Daemon thread for daily scheduled runs (NOT Celery)
+  - Parses times like "0300,1500" → run at 3am and 3pm
+  - Uses 30-second poll interval, tracks last run date to prevent duplicates
+- **Genre organization**: Optional folder structure `/movies/Action/` using TMDB genres
 
 ---
 
