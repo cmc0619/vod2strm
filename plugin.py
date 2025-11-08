@@ -286,7 +286,7 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]]) -> None:
     m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
-    url = f"{base_url.rstrip('/')}/proxy/vod/movies/{movie.uuid}"
+    url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
     wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
     report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
@@ -303,7 +303,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
-    url = f"{base_url.rstrip('/')}/proxy/vod/episodes/{episode.uuid}"
+    url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
     wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
     title = getattr(episode, "name", "") or ""
     report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
