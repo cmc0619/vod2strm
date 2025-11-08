@@ -440,7 +440,10 @@ def _run_job_sync(
 
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int) -> None:
     LOGGER.info("Scanning movies...")
-    qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    # Only generate .strm files for movies with active provider relations
+    qs = Movie.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
 
@@ -486,7 +489,10 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
 
 def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int) -> None:
     LOGGER.info("Scanning series...")
-    series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    # Only generate .strm files for series with active provider relations
+    series_qs = Series.objects.filter(
+        m3u_relations__m3u_account__is_active=True
+    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
@@ -506,7 +512,11 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
                 continue
 
-            eps = list(Episode.objects.filter(series_id=s.id).only(
+            # Only generate episodes that have active provider relations
+            eps = list(Episode.objects.filter(
+                series_id=s.id,
+                m3u_relations__m3u_account__is_active=True
+            ).distinct().only(
                 "id", "uuid", "name", "season_number", "episode_number",
                 "air_date", "description", "rating", "tmdb_id", "imdb_id"
             ).order_by("season_number", "episode_number"))
