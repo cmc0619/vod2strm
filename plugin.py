@@ -761,10 +761,10 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
 def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     # Only generate .strm files for series with active provider relations
-    # Annotate with episode count to avoid N+1 queries
+    # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
     series_qs = Series.objects.filter(
         m3u_relations__m3u_account__is_active=True
-    ).annotate(episode_count=Count('episode')).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).annotate(episode_count=Count('episode', distinct=True)).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
