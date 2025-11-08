@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import logging
 import logging.handlers
 import os
@@ -33,7 +34,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Dict, Any
 
 from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
 from django.db import transaction  # noqa:F401
@@ -108,6 +109,40 @@ def _configure_file_logger(debug_enabled: bool) -> None:
         _FILE_LOGGER_CONFIGURED = True
 
 
+# -------------------- Manifest (Metadata Cache) --------------------
+
+def _load_manifest(root: Path) -> Dict[str, Any]:
+    """
+    Load manifest file or return default.
+    Manifest tracks written files to avoid unnecessary disk writes.
+    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode"}}, "version": 1}
+    """
+    manifest_path = root / ".vod2strm_manifest.json"
+    try:
+        if manifest_path.exists():
+            with manifest_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        LOGGER.warning("Failed to load manifest from %s: %s", manifest_path, e)
+    return {"files": {}, "version": 1}
+
+
+def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
+    """
+    Save manifest file atomically using temp file + rename.
+    Minimizes risk of corruption if interrupted.
+    """
+    manifest_path = root / ".vod2strm_manifest.json"
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(f".tmp.{int(time.time() * 1000)}")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        tmp_path.replace(manifest_path)
+    except Exception as e:
+        LOGGER.warning("Failed to save manifest to %s: %s", manifest_path, e)
+
+
 # -------------------- Small helpers --------------------
 
 def _ts() -> str:
@@ -168,6 +203,36 @@ def _write_if_changed(path: Path, content: bytes) -> Tuple[bool, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return (True, "created" if existing is None else "updated")
+
+
+def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str) -> Tuple[bool, str]:
+    """
+    Write .strm file only if UUID changed or file doesn't exist in manifest.
+    Checks manifest first to avoid disk reads when possible.
+
+    Returns (written, reason)
+    reason ∈ {"created", "updated", "cached_skip"}
+    """
+    path_str = str(path)
+    manifest_files = manifest.get("files", {})
+
+    # Check manifest cache first - avoid disk I/O entirely
+    if path_str in manifest_files:
+        cached_entry = manifest_files[path_str]
+        if cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type:
+            # UUID hasn't changed, skip write (and skip read!)
+            return (False, "cached_skip")
+
+    # UUID changed or not in manifest - need to write
+    content = (url + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+    # Update manifest
+    is_new = path_str not in manifest_files
+    manifest_files[path_str] = {"uuid": uuid, "type": file_type}
+
+    return (True, "created" if is_new else "updated")
 
 
 def _xml_escape(text: str | None) -> str:
@@ -283,11 +348,11 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any]) -> None:
     m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
-    wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
+    wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie")
     with lock:
         report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
@@ -299,14 +364,14 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any]) -> None:
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
-    wrote, reason = _write_if_changed(strm_path, (url + "\n").encode("utf-8"))
+    wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode")
     title = getattr(episode, "name", "") or ""
     with lock:
         report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
@@ -451,11 +516,14 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     qs = Movie.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
+
+    # Load manifest for caching
+    manifest = _load_manifest(root)
     lock = threading.Lock()
 
     def job(m: Movie) -> None:
         try:
-            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock)
+            _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest)
         except Exception as e:
             LOGGER.warning("Movie id=%s failed: %s", m.id, e)
             with lock:
@@ -463,6 +531,10 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         list(ex.map(job, work))
+
+    # Save manifest after all writes
+    _save_manifest(root, manifest)
+    LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
 
 
 def _maybe_internal_refresh_series(series: Series) -> bool:
@@ -499,6 +571,9 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     series_qs = Series.objects.all().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
+
+    # Load manifest for caching
+    manifest = _load_manifest(root)
     lock = threading.Lock()
 
     for s in series_qs.iterator(chunk_size=200):
@@ -529,7 +604,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 continue
 
             def job(e: Episode) -> None:
-                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock)
+                _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest)
 
             with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                 list(ex.map(job, eps))
@@ -538,6 +613,10 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
             LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
             with lock:
                 rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(getattr(s, "uuid", "")), "", "", "error", str(e)])
+
+    # Save manifest after all writes
+    _save_manifest(root, manifest)
+    LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
 
 
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
