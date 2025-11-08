@@ -38,6 +38,7 @@ from typing import Iterable, List, Tuple, Dict, Any
 
 from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
 from django.db import transaction  # noqa:F401
+from django.db.models import Count
 from django.utils.timezone import now  # noqa:F401
 
 # ORM models (plugin runs in-process with the app)
@@ -75,6 +76,7 @@ if not LOGGER.handlers:
 
 _FILE_LOGGER_CONFIGURED = False
 _LOG_LOCK = threading.Lock()
+_MANIFEST_LOCK = threading.Lock()  # Protects manifest dict from concurrent modification
 
 
 def _ensure_dirs() -> None:
@@ -295,20 +297,24 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     manifest_files = manifest.get("files", {})
 
     # Check manifest cache first - avoid disk I/O entirely
-    if path_str in manifest_files:
-        cached_entry = manifest_files[path_str]
-        if cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type:
-            # Verify file still exists before trusting cache
-            if path.exists():
-                # UUID hasn't changed and file exists, skip write (and skip read!)
-                return (False, "cached_skip")
-            # Manifest is stale - file was deleted/corrupted
-            LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
+    cache_matches = False
+    with _MANIFEST_LOCK:
+        if path_str in manifest_files:
+            cached_entry = manifest_files[path_str]
+            cache_matches = cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type
+
+    # If cache matches, verify file exists (outside lock to minimize lock time)
+    if cache_matches:
+        if path.exists():
+            return (False, "cached_skip")
+        # Manifest is stale - file was deleted/corrupted
+        LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
 
     # UUID changed or not in manifest
     if dry_run:
         # Don't write, but report what would happen
-        is_new = path_str not in manifest_files
+        with _MANIFEST_LOCK:
+            is_new = path_str not in manifest_files
         return (False, f"dry_run_{'create' if is_new else 'update'}")
 
     # Write for real
@@ -317,8 +323,9 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     path.write_bytes(content)
 
     # Update manifest
-    is_new = path_str not in manifest_files
-    manifest_files[path_str] = {"uuid": uuid, "type": file_type}
+    with _MANIFEST_LOCK:
+        is_new = path_str not in manifest_files
+        manifest_files[path_str] = {"uuid": uuid, "type": file_type}
 
     return (True, "created" if is_new else "updated")
 
@@ -507,11 +514,13 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
 
 # -------------------- Cleanup --------------------
 
-def _cleanup(rows: List[List[str]], root: Path, apply: bool) -> None:
+def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply: bool) -> None:
     """
     Identify and optionally remove stale *.strm files that reference UUIDs not present in DB.
+    Also prunes stale entries from manifest when files are deleted.
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
+    manifest_files = manifest.get("files", {})
     movie_uuids = set(Movie.objects.values_list("uuid", flat=True))
     episode_uuids = set(Episode.objects.values_list("uuid", flat=True))
 
@@ -550,6 +559,11 @@ def _cleanup(rows: List[List[str]], root: Path, apply: bool) -> None:
         if apply:
             try:
                 p.unlink()
+                # Remove from manifest
+                path_str = str(p)
+                with _MANIFEST_LOCK:
+                    if path_str in manifest_files:
+                        del manifest_files[path_str]
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "deleted", f"stale_{typ}"])
             except Exception as e:
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "error", f"delete_failed: {e}"])
@@ -618,7 +632,13 @@ def _run_job_sync(
         if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
             # Skip cleanup in dry run mode
             if not dry_run:
-                _cleanup(rows, root, apply=(cleanup_mode == CLEANUP_APPLY))
+                # Load manifest to prune stale entries
+                manifest = _load_manifest(root)
+                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
+                # Save manifest after pruning (only if files were deleted)
+                if cleanup_mode == CLEANUP_APPLY:
+                    _save_manifest(root, manifest)
+                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
     except Exception as e:  # pragma: no cover
         LOGGER.exception("Job failed: %s", e)
@@ -741,9 +761,10 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
 def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     # Only generate .strm files for series with active provider relations
+    # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
     series_qs = Series.objects.filter(
         m3u_relations__m3u_account__is_active=True
-    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).annotate(episode_count=Count('episode', distinct=True)).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
@@ -759,7 +780,8 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     for s in series_qs.iterator(chunk_size=200):
         try:
             series_folder = root / "TV" / _series_folder_name(s.name or "", getattr(s, "year", None))
-            expected = _series_expected_count(s.id)
+            # Use annotated episode_count to avoid N+1 query
+            expected = getattr(s, 'episode_count', 0)
 
             if expected == 0:
                 LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh.", s.id)
