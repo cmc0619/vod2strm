@@ -986,12 +986,21 @@ class Plugin:
         {"id": "generate_all", "label": "Generate All"},
     ]
 
-    def run(self, action: str, params: dict, context: dict):
+    def run(self, action_id, params, context):
         """
         Dispatcharr calls this when a button is clicked.
         We enqueue a background job (Celery if available, else a thread).
+
+        Args:
+            action_id: The action being run (e.g., "generate_movies")
+            params: Parameters from the UI (usually empty dict)
+            context: Dict with "settings", "logger", and "actions"
         """
+        # Extract settings from context (new plugin API)
         settings = context.get("settings", {})
+        action = action_id  # Keep same variable name for compatibility
+
+
         _configure_file_logger(settings.get("debug_logging", False))
 
         output_root = Path(settings.get("output_root") or DEFAULT_ROOT)
