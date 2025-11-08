@@ -1109,8 +1109,8 @@ class Plugin:
 
 
 # -------------------- Celery task registration --------------------
-
-if celery_app:
+# TEMP: Disabled for testing without Celery workers - remove to re-enable
+if False and celery_app:
     @celery_app.task(name="plugins.vod2strm.tasks.run_job")
     def celery_run_job(args: dict):
         _run_job_sync(**args)
