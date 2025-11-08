@@ -30,7 +30,50 @@
 - Use curl with GitHub API for PR operations (gh CLI doesn't work with protected main)
 
 ## Future Features (Backlog)
-- **Incremental episode updates with caching**: Instead of full refresh, fetch provider episode list and only add missing episodes. User has another version of this plugin with this implemented - can steal ideas from it later.
+
+### Incremental Episode Updates with Caching
+**Problem**: Currently only refreshes series with 0 episodes. New episodes released after initial generation are never detected.
+
+**Example scenario**:
+- Week 1: Series has 10 episodes → generates 10 .strm files
+- Week 2: Provider releases episode 11 → plugin sees 10 in DB, skips (thinks tree_complete)
+- Result: Episode 11 never gets generated ❌
+
+**Solution components** (reference implementations: vodstrmpg, strmvod):
+
+1. **Manifest file tracking** (`.vod2strm_manifest.json`):
+   ```json
+   {
+     "series": {
+       "series_id_123": {
+         "last_refresh": "2025-11-07T12:00:00Z",
+         "episode_count": 10,
+         "provider_episode_ids": ["ep1", "ep2", ...]
+       }
+     }
+   }
+   ```
+
+2. **Time-based refresh check**:
+   - If `last_refresh > 24 hours` → fetch provider episode list
+   - Compare provider count vs manifest count
+   - If different → refresh needed
+
+3. **Incremental file writes** (from strmvod/vodstrmpg):
+   - `write_text_if_changed()` only writes if content differs
+   - Avoids unnecessary disk writes for existing .strm files
+   - Returns: `(changed: bool, reason: str)` → "unchanged", "written", "dry_run"
+
+4. **Key insight**:
+   - Both reference plugins still fetch FULL episode list from provider API
+   - "Incremental" means not re-writing unchanged .strm files
+   - NOT incremental API calls (provider API returns full list anyway)
+   - Our plugin just needs to periodically check provider for new episodes
+
+**Bonus optimization from vodstrmpg**:
+- Batched TMDB season fetching: `_tmdb_fetch_season_map(series_id, season_num)`
+- Fetches entire season once instead of per-episode HTTP calls
+- Cached with key: `season:{series}:{season}` in manifest
 
 ---
 
