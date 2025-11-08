@@ -1,45 +1,39 @@
-vod2strm – Dispatcharr Plugin
-Author: ChatGPT (per user spec)
+# vod2strm – Dispatcharr Plugin
 
-Overview
+A high-performance Dispatcharr plugin that exports your VOD library (Movies and Series/Episodes) into a structured filesystem of `.strm` and `.nfo` files for Plex, Emby, Jellyfin, or Kodi.
 
-vod2strm is a Dispatcharr plugin that exports your VOD library (Movies and Series/Episodes) from the internal database into a structured filesystem tree of .strm and .nfo files.
-This allows media servers such as Plex, Emby, or Jellyfin to index Dispatcharr’s VOD items directly without duplicating the underlying media.
+## Overview
 
-The plugin runs completely inside Dispatcharr, using the ORM for speed and Celery for background jobs (non-blocking UI).
-If Celery isn’t available, it falls back to background threads automatically.
+vod2strm transforms Dispatcharr's VOD database into media server-compatible `.strm` files without duplicating content. It runs entirely inside Dispatcharr using the Django ORM for performance and Celery for background jobs. If Celery isn't available, it gracefully falls back to background threads.
 
-Features
+## Features
 
-✅ Movies + Series Support
-Builds .strm files pointing to Dispatcharr’s proxy endpoints
-(/proxy/vod/movies/{uuid} and /proxy/vod/episodes/{uuid}).
+### Core Functionality
+- **Movies + Series Support**: Generates `.strm` files pointing to Dispatcharr proxy endpoints (`/proxy/vod/movie/{uuid}` and `/proxy/vod/episode/{uuid}`)
+- **NFO Generation**: Creates `movie.nfo`, `season.nfo`, and `SxxExx.nfo` with TMDB/IMDB metadata
+- **Season 00 Specials**: Automatically organizes season 0 episodes into "Season 00 (Specials)" folders
+- **Manifest Caching**: Tracks generated files to skip unnecessary writes (protects SD cards/NAS from wear)
+- **Cleanup**: Detects and removes `.strm` files for content no longer in the database (Preview or Apply modes)
 
-✅ NFO Generation
-Creates movie.nfo, season.nfo, and SxxExx.nfo beside each .strm.
-Writes only when content changes.
+### Performance & Protection
+- **Adaptive Throttling**: Monitors NAS write performance and dynamically adjusts concurrency to prevent I/O overload
+- **Smart Skipping**: Instantly skips entire series when filesystem already matches database
+- **Batch Processing**: Processes files in batches with progress logging
+- **Compare-Before-Write**: Only writes when content changes (hash-based comparison for NFO files)
 
-✅ Season 00 (Specials)
-Automatically places season_number = 0 episodes in Season 00 (Specials) folders.
+### Automation
+- **Scheduled Runs**: Optional Celery beat scheduling with crontab or `daily HH:MM` syntax
+- **Auto-run After VOD Refresh**: Optionally trigger generation automatically when Dispatcharr refreshes VOD content (30-second debounce)
 
-✅ Cleanup
-Detects and optionally deletes .strm files whose UUIDs no longer exist in the DB.
-Modes: Off | Preview | Apply.
+### Debugging & Reports
+- **Dry Run Mode**: Simulate generation without touching filesystem (testing)
+- **Database Statistics**: View content counts and provider breakdown
+- **CSV Reports**: Detailed action logs for every run (`/data/plugins/vod2strm/reports/`)
+- **Verbose Logging**: Optional debug logs (`/data/plugins/vod2strm/logs/vod2strm.log`)
 
-✅ Fast & Smart
-Skips entire series instantly when filesystem already matches the DB.
-Writes as it goes — no waiting for all series to finish.
+## Output Structure
 
-✅ Robust Debug Logging
-Verbose logs written to /data/plugins/vod2strm/logs/vod2strm.log.
-
-✅ CSV Reporting
-Every action writes a detailed CSV report to /data/plugins/vod2strm/reports/.
-
-✅ Optional Scheduling
-Run automatically via Celery beat using a daily time or full crontab string.
-
-Output Structure
+```
 /data/STRM/
 ├── Movies/
 │   └── Movie Name (2023)/
@@ -48,76 +42,129 @@ Output Structure
 └── TV/
     └── Series Name (2021)/
         ├── Season 01/
-        │   ├── S01E01 – Episode Title.strm
+        │   ├── S01E01 - Episode Title.strm
         │   ├── S01E01.nfo
         │   └── season.nfo
         └── Season 00 (Specials)/
-            └── S00E01 – Special Title.strm
+            └── S00E01 - Special Title.strm
+```
 
-Settings
-Setting	Type	Default	Description
-Output Root Folder	Text	/data/STRM	Destination for .strm and .nfo files.
-Base URL (for .strm)	Text	http://192.168.199.10:9191	Written inside each .strm file.
-Write NFO files	Boolean	✅	Generate NFO metadata alongside .strms.
-Cleanup	Select	Off	Off / Preview / Apply – removes stale files.
-Filesystem concurrency	Number	12	Parallel file-write workers.
-Robust debug logging	Boolean	☐	Enable verbose logging to /data/plugins/vod2strm/logs/.
-Schedule	Text	(blank)	daily HH:MM or 0 30 3 * * * (crontab) for Celery beat.
-Actions / Buttons
-Action	Description
-Stats (CSV)	Writes a summary CSV (counts from DB + filesystem).
-Generate Movies	Builds .strm + NFO files for all movies.
-Generate Series	Builds .strm + NFO files for all series/episodes.
-Generate All	Runs both Movies + Series and optional Cleanup.
-Reports & Logs
+## Settings
 
-CSV Reports:
-/data/plugins/vod2strm/reports/report_<mode>_<timestamp>.csv
-Columns: type, series_name, season, title, uuid, action, reason
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| **Output Root Folder** | Text | `/data/STRM` | Destination for `.strm` and `.nfo` files |
+| **Base URL (for .strm)** | Text | `http://dispatcharr:9191` | URL written inside each `.strm` file |
+| **Write NFO files** | Boolean | ✅ | Generate NFO metadata alongside `.strm` files |
+| **Cleanup** | Select | Off | Off / Preview / Apply – removes stale files |
+| **Max Filesystem Concurrency** | Number | 4 | Maximum concurrent file operations (adaptive throttling adjusts automatically) |
+| **Adaptive Throttling** | Boolean | ✅ | Auto-adjust concurrency based on NAS performance |
+| **Auto-run after VOD Refresh** | Boolean | ☐ | Automatically generate files when Dispatcharr refreshes VOD content |
+| **Dry Run** | Boolean | ☐ | Simulate without writing (testing mode) |
+| **Robust debug logging** | Boolean | ☐ | Enable verbose logging to `/data/plugins/vod2strm/logs/` |
+| **Schedule** | Text | (blank) | `daily HH:MM` or `0 30 3 * * *` (crontab) for Celery beat |
 
-Logs:
-/data/plugins/vod2strm/logs/vod2strm.log
+## Actions
 
-Installation
+| Action | Description |
+|--------|-------------|
+| **Database Statistics** | Shows content counts, provider breakdown, and series without episodes |
+| **Stats (CSV)** | Writes summary CSV (counts from DB + filesystem) |
+| **Generate Movies** | Builds `.strm` + NFO files for all movies |
+| **Generate Series** | Builds `.strm` + NFO files for all series/episodes |
+| **Generate All** | Runs Movies + Series generation plus optional Cleanup |
 
-Create plugin directory
+## Installation
 
+### 1. Create plugin directory
+
+```bash
 mkdir -p /opt/dispatcharr/plugins/vod2strm
+```
 
+### 2. Copy files
 
-Copy files
-
+```
 vod2strm/
 ├── __init__.py
 └── plugin.py
+```
 
+### 3. Restart Dispatcharr
 
-Restart Dispatcharr (or reload plugins).
+Restart Dispatcharr or reload plugins via the UI.
 
-Configure via Settings → Plugins → vod2strm.
+### 4. Configure
 
-Versioning Policy
+Navigate to **Settings → Plugins → vod2strm** and configure your settings.
 
-Semantic format MAJOR.MINOR.PATCH
-Starts at 0.0.1 and increments the third digit (e.g., 0.0.2, 0.0.3 …).
+## Reports & Logs
 
-Safety Notes
+### CSV Reports
+`/data/plugins/vod2strm/reports/report_<mode>_<timestamp>.csv`
 
-Read-only access to Dispatcharr DB (no modifications).
+Columns: `type`, `series_name`, `season`, `title`, `year`, `db_uuid`, `strm_path`, `nfo_path`, `action`, `reason`
 
-Writes only within the configured output root.
+### Logs
+`/data/plugins/vod2strm/logs/vod2strm.log`
 
-Compare-before-write prevents redundant I/O.
+Rotating log files with debug information (when enabled).
 
-Cleanup → Apply permanently deletes stale files — use with care.
+## Performance Tips
 
-Future Ideas
+### First Run (100K+ files)
+- **Adaptive throttling** starts at 4 workers and adjusts based on your NAS performance
+- Slow NAS (>200ms writes): Automatically reduces to 3→2→1 workers
+- Fast NAS (<50ms writes): Increases up to your max concurrency setting
+- Progress logged every 100 files: `"Movies: processed 100 / 10000 (current workers: 3)"`
 
-Inline CSV preview in the Dispatcharr UI.
+### Subsequent Runs
+- **Manifest caching** skips writes for unchanged files (most files skip on 2nd+ runs)
+- Only new content or changed metadata triggers writes
+- Minimal SD card/NAS wear
 
-Manual “Hydrate Episodes” button for zero-episode series.
+### Scheduled Daily Runs
+- Set **Schedule** to `daily 03:00` for automatic 3am generation
+- Enable **Auto-run after VOD Refresh** to auto-generate when Dispatcharr adds new content
+- Disable **Dry Run** for scheduled runs (always runs for real)
 
-Optional filters (year range, group, language).
+## Safety Notes
 
-License
+- ✅ Read-only access to Dispatcharr database (no modifications)
+- ✅ Writes only within configured output root
+- ✅ Compare-before-write prevents redundant I/O
+- ⚠️ **Cleanup → Apply** permanently deletes stale files — use Preview first!
+- ⚠️ First run on large libraries may take hours (adaptive throttling helps)
+
+## Troubleshooting
+
+### NAS appears "stuck" on first run
+**Expected behavior** - Processing 100K files takes time. Check logs for progress:
+```
+Movies: processed 100 / 10000 (current workers: 3)
+Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
+```
+
+### Files not updating after VOD refresh
+- Enable **Auto-run after VOD Refresh** for automatic generation
+- Or manually click **Generate All** after refreshing content
+- Check **Database Statistics** to verify content is in Dispatcharr
+
+### Some series missing episodes
+- Use **Database Statistics** to find series without episodes
+- Plugin auto-refreshes series with 0 episodes on first encounter
+- Check Dispatcharr VOD refresh to ensure provider has episode data
+
+## Versioning
+
+Semantic versioning: `MAJOR.MINOR.PATCH`
+- Current: `0.0.1`
+- Increments: `0.0.2`, `0.0.3`, etc.
+
+## License
+
 MIT / Public Domain — use freely, attribution appreciated.
+
+---
+
+**Made for Dispatcharr** | Report issues on GitHub
