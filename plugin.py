@@ -350,10 +350,9 @@ def _xml_escape(text: str | None) -> str:
 # -------------------- NFO Builders --------------------
 
 def _nfo_movie(m: Movie) -> bytes:
-    # Use title field if available, fallback to name
-    movie_title = getattr(m, "title", None) or m.name or ""
+    # Use name field - title field doesn't exist in Movie model
     fields = {
-        "title": movie_title,
+        "title": m.name or "",
         "plot": getattr(m, "description", "") or "",
         "year": str(getattr(m, "year", "") or ""),
         "rating": str(getattr(m, "rating", "") or ""),
@@ -451,10 +450,10 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 # -------------------- Generators --------------------
 
 def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
-    # Use title field (without year) if available, fallback to name
-    movie_title = getattr(movie, "title", None) or movie.name or ""
-    m_folder = root / "Movies" / _movie_folder_name(movie_title, getattr(movie, "year", None))
-    strm_path = m_folder / f"{_movie_folder_name(movie_title, getattr(movie, 'year', None))}.strm"
+    # Use name field - title field doesn't exist in Movie model
+    movie_name = movie.name or ""
+    m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
+    strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
 
     # Time the write operation for adaptive throttling
@@ -464,7 +463,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         throttle.record_write(time.time() - start_time)
 
     with lock:
-        report_rows.append(["movie", "", "", movie_title, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
+        report_rows.append(["movie", "", "", movie_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
         nfo_path = m_folder / "movie.nfo"
@@ -701,7 +700,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Only generate .strm files for movies with active provider relations
     qs = Movie.objects.filter(
         m3u_relations__m3u_account__is_active=True
-    ).distinct().only("id", "uuid", "title", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
 
