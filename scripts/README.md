@@ -1,8 +1,24 @@
 # Database Cleanup Scripts
 
-## cleanup_db.py
+## ⚠️ Recommended: Use Plugin UI Buttons Instead
 
-Flexible script to delete VOD content from the Dispatcharr database.
+**The vod2strm plugin now has built-in cleanup buttons (Issue #556)!**
+
+For most use cases, use the cleanup buttons in the Dispatcharr plugin UI:
+- **List Series (Cleanup)** - View series with episode counts
+- **Delete ALL Episodes** - Remove all episodes
+- **Delete ALL Series** - Remove all series (cascades to episodes)
+- **Delete ALL Movies** - Remove all movies
+
+These buttons use Django ORM, run immediately, and show results in the UI.
+
+---
+
+## cleanup_db.py (Standalone Script)
+
+**Use this script only if you need command-line access or automation.**
+
+Flexible standalone script to delete VOD content from the Dispatcharr database.
 
 ### Quick Start
 
