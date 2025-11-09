@@ -159,8 +159,9 @@ class AdaptiveThrottle:
     """
 
     def __init__(self, max_workers: int, enabled: bool = True):
-        # Hard cap at 8 to prevent DB connection exhaustion (Django creates 1 conn per thread)
-        self.max_workers = min(max_workers, 8)
+        # Hard cap at 4 to prevent DB connection exhaustion (Django creates 1 conn per thread)
+        # Even though workers do file I/O, accessing model attributes triggers DB connections
+        self.max_workers = min(max_workers, 4)
         self.enabled = enabled
         self.current_workers = self.max_workers
         self.write_times = []  # Rolling window of last N write times
