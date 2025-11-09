@@ -985,8 +985,6 @@ def _db_cleanup() -> str:
     Returns:
         Formatted string with operation results
     """
-    from django.db import transaction
-
     results = []
     results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
 
