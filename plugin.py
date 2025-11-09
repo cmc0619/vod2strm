@@ -257,9 +257,18 @@ def _series_folder_name(name: str, year: int | None) -> str:
 
 
 def _movie_folder_name(name: str, year: int | None) -> str:
-    if year:
+    """
+    Generate folder name for movie, avoiding year duplication.
+    If name already ends with (YYYY), don't add year again.
+    """
+    if not name:
+        name = "Unknown Movie"
+
+    # Check if name already ends with (YYYY) pattern
+    import re
+    if year and not re.search(r'\(\d{4}\)\s*$', name):
         return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name or "Unknown Movie")
+    return _norm_fs_name(name)
 
 
 def _hash_bytes(b: bytes) -> str:
