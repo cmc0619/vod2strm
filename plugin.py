@@ -257,9 +257,17 @@ def _series_folder_name(name: str, year: int | None) -> str:
 
 
 def _movie_folder_name(name: str, year: int | None) -> str:
-    """Generate folder name for movie."""
+    """
+    Generate folder name for movie.
+    Strips any existing (YYYY) pattern from name to avoid duplication when adding year.
+    """
     if not name:
         name = "Unknown Movie"
+
+    # Strip trailing (YYYY) pattern if present to avoid duplication
+    # Example: "The Matrix (1999)" -> "The Matrix"
+    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
+
     if year:
         return _norm_fs_name(f"{name} ({year})")
     return _norm_fs_name(name)
