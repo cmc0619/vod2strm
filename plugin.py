@@ -257,9 +257,12 @@ def _series_folder_name(name: str, year: int | None) -> str:
 
 
 def _movie_folder_name(name: str, year: int | None) -> str:
+    """Generate folder name for movie."""
+    if not name:
+        name = "Unknown Movie"
     if year:
         return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name or "Unknown Movie")
+    return _norm_fs_name(name)
 
 
 def _hash_bytes(b: bytes) -> str:
@@ -347,8 +350,10 @@ def _xml_escape(text: str | None) -> str:
 # -------------------- NFO Builders --------------------
 
 def _nfo_movie(m: Movie) -> bytes:
+    # Use title field if available, fallback to name
+    movie_title = getattr(m, "title", None) or m.name or ""
     fields = {
-        "title": m.name or "",
+        "title": movie_title,
         "plot": getattr(m, "description", "") or "",
         "year": str(getattr(m, "year", "") or ""),
         "rating": str(getattr(m, "rating", "") or ""),
@@ -446,8 +451,10 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 # -------------------- Generators --------------------
 
 def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
-    m_folder = root / "Movies" / _movie_folder_name(movie.name or "", getattr(movie, "year", None))
-    strm_path = m_folder / f"{_movie_folder_name(movie.name or '', getattr(movie, 'year', None))}.strm"
+    # Use title field (without year) if available, fallback to name
+    movie_title = getattr(movie, "title", None) or movie.name or ""
+    m_folder = root / "Movies" / _movie_folder_name(movie_title, getattr(movie, "year", None))
+    strm_path = m_folder / f"{_movie_folder_name(movie_title, getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
 
     # Time the write operation for adaptive throttling
@@ -457,7 +464,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         throttle.record_write(time.time() - start_time)
 
     with lock:
-        report_rows.append(["movie", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
+        report_rows.append(["movie", "", "", movie_title, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
         nfo_path = m_folder / "movie.nfo"
@@ -519,7 +526,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
 def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply: bool) -> None:
     """
     Identify and optionally remove stale *.strm files that reference UUIDs not present in DB.
-    Also prunes stale entries from manifest when files are deleted.
+    Also deletes associated NFO files and prunes empty directories.
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
     manifest_files = manifest.get("files", {})
@@ -544,6 +551,7 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
     strm_files = list(root.rglob("*.strm")) if root.exists() else []
     LOGGER.info("Cleanup scanning %d .strm files", len(strm_files))
     stale_paths = []
+    deleted_nfos = 0
 
     for p in strm_files:
         kind, payload = check_one(p)
@@ -560,33 +568,70 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
         stale_paths.append(p)
         if apply:
             try:
+                # Delete the .strm file
                 p.unlink()
                 # Remove from manifest
                 path_str = str(p)
                 with _MANIFEST_LOCK:
                     if path_str in manifest_files:
                         del manifest_files[path_str]
+
+                # Delete associated NFO files
+                if typ == "movie":
+                    # Delete movie.nfo in the same folder
+                    nfo_path = p.parent / "movie.nfo"
+                    if nfo_path.exists():
+                        nfo_path.unlink()
+                        deleted_nfos += 1
+                else:  # episode
+                    # Delete S##E##.nfo for this episode
+                    # .strm filename is like "S01E02 - Title.strm", .nfo is "S01E02.nfo"
+                    strm_stem = p.stem  # "S01E02 - Title"
+                    # Extract S##E## pattern
+                    m = re.match(r'(S\d+E\d+)', strm_stem, re.I)
+                    if m:
+                        episode_nfo = p.parent / f"{m.group(1)}.nfo"
+                        if episode_nfo.exists():
+                            episode_nfo.unlink()
+                            deleted_nfos += 1
+
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "deleted", f"stale_{typ}"])
             except Exception as e:
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "error", f"delete_failed: {e}"])
         else:
             rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "would_delete", f"stale_{typ}"])
 
-    # prune empty dirs in apply mode
+    # prune empty dirs and season.nfo files in apply mode
     if apply:
-        pruned = 0
+        pruned_dirs = 0
+        pruned_season_nfos = 0
         # Walk deepest-first
         for d in sorted({p.parent for p in stale_paths}, key=lambda x: len(str(x)), reverse=True):
             try:
+                # Check if season.nfo exists in empty season folder and delete it
+                if d.exists():
+                    season_nfo = d / "season.nfo"
+                    if season_nfo.exists() and not any(f for f in d.iterdir() if f.suffix == '.strm'):
+                        # No .strm files left in season folder, delete season.nfo
+                        season_nfo.unlink()
+                        pruned_season_nfos += 1
+
+                # Delete empty directories
                 cur = d
                 while cur != root and cur.exists() and not any(cur.iterdir()):
                     cur.rmdir()
-                    pruned += 1
+                    pruned_dirs += 1
                     cur = cur.parent
             except Exception:
                 pass
-        rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned)])
-    LOGGER.info("Cleanup finished (apply=%s)", apply)
+
+        if deleted_nfos > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_nfos", str(deleted_nfos)])
+        if pruned_season_nfos > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_season_nfos", str(pruned_season_nfos)])
+        if pruned_dirs > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned_dirs)])
+    LOGGER.info("Cleanup finished (apply=%s, deleted_nfos=%d)", apply, deleted_nfos)
 
 
 # -------------------- Jobs --------------------
@@ -622,6 +667,18 @@ def _run_job_sync(
     rows: List[List[str]] = []
 
     try:
+        # Run cleanup BEFORE generation to remove stale files first
+        # This prevents the bug where newly written files get deleted because
+        # cleanup loads the old manifest before the new one is saved
+        if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
+            if not dry_run:
+                manifest = _load_manifest(root)
+                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
+                # Save updated manifest after cleanup (pruned stale entries)
+                if cleanup_mode == CLEANUP_APPLY:
+                    _save_manifest(root, manifest)
+                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
+
         if mode in ("movies", "all"):
             _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
 
@@ -630,17 +687,6 @@ def _run_job_sync(
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
-
-        if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
-            # Skip cleanup in dry run mode
-            if not dry_run:
-                # Load manifest to prune stale entries
-                manifest = _load_manifest(root)
-                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
-                # Save manifest after pruning (only if files were deleted)
-                if cleanup_mode == CLEANUP_APPLY:
-                    _save_manifest(root, manifest)
-                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
     except Exception as e:  # pragma: no cover
         LOGGER.exception("Job failed: %s", e)
@@ -655,7 +701,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Only generate .strm files for movies with active provider relations
     qs = Movie.objects.filter(
         m3u_relations__m3u_account__is_active=True
-    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).distinct().only("id", "uuid", "title", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
 
@@ -927,6 +973,45 @@ def _db_stats() -> str:
     return "\n".join(stats)
 
 
+def _db_cleanup() -> str:
+    """
+    Database cleanup - deletes ALL episodes and episode relations.
+    Issue #556 - Quick database cleanup for development/debugging.
+
+    Replicates these SQL commands in Django ORM:
+        DELETE FROM vod_episode;
+        DELETE FROM vod_m3uepisoderelation;
+
+    Returns:
+        Formatted string with operation results
+    """
+    results = []
+    results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
+
+    try:
+        # Count what will be deleted
+        episode_count = Episode.objects.count()
+
+        results.append(f"Episodes to delete: {episode_count}")
+
+        if episode_count > 0:
+            with transaction.atomic():
+                # Delete all episodes (cascade deletes will handle M3UEpisodeRelation automatically)
+                deleted_count, details = Episode.objects.all().delete()
+                results.append(f"\n✓ Deleted {deleted_count} objects:")
+                for model, count in details.items():
+                    if count > 0:
+                        results.append(f"  - {model}: {count}")
+        else:
+            results.append("\nNothing to delete.")
+
+    except Exception as e:
+        LOGGER.exception("Database cleanup failed")
+        results.append(f"\nERROR: {e}")
+
+    return "\n".join(results)
+
+
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
     movies = Movie.objects.count()
     series = Series.objects.count()
@@ -1035,6 +1120,7 @@ class Plugin:
         {"id": "generate_movies", "label": "Generate Movies"},
         {"id": "generate_series", "label": "Generate Series"},
         {"id": "generate_all", "label": "Generate All"},
+        {"id": "db_cleanup", "label": "🗑️ Delete ALL Episodes"},
     ]
 
     def run(self, action_id, params, context):
@@ -1076,6 +1162,15 @@ class Plugin:
             except Exception as e:
                 LOGGER.exception("Database statistics failed")
                 return {"status": "error", "message": f"Failed to generate stats: {e}"}
+
+        # Database cleanup (Issue #556) - delete all episodes and episode relations
+        if action == "db_cleanup":
+            try:
+                result_text = _db_cleanup()
+                return {"status": "ok", "message": result_text}
+            except Exception as e:
+                LOGGER.exception("Database cleanup failed")
+                return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
             self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)

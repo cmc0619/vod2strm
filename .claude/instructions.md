@@ -29,6 +29,25 @@
 - If you don't have a token (e.g., after context reset), ask the user for it
 - Use curl with GitHub API for PR operations (gh CLI doesn't work with protected main)
 
+## Recent Features
+
+### Database Cleanup Buttons (Issue #556)
+**Problem**: During development/debugging, need to frequently clear database content without manual SQL commands.
+
+**Solution**: Added cleanup buttons to plugin UI using Django ORM:
+- **List Series (Cleanup)**: Shows most recent 50 series with episode counts and IDs
+- **Delete ALL Episodes**: Removes all episodes (keeps series metadata)
+- **Delete ALL Series**: Removes all series and cascades to episodes
+- **Delete ALL Movies**: Removes all movies
+
+**Implementation** (`plugin.py:930-1048`):
+- `_db_cleanup()` function with Django ORM transactions
+- Synchronous operations (no queuing) for immediate feedback
+- Automatic cascade handling via Django's delete() method
+- Transaction rollback on errors for data integrity
+
+**Usage**: Click cleanup buttons in plugin UI, results shown immediately in message box.
+
 ## Future Features (Backlog)
 
 ### Incremental Episode Updates with Caching
