@@ -528,7 +528,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
 def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply: bool) -> None:
     """
     Identify and optionally remove stale *.strm files that reference UUIDs not present in DB.
-    Also prunes stale entries from manifest when files are deleted.
+    Also deletes associated NFO files and prunes empty directories.
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
     manifest_files = manifest.get("files", {})
@@ -553,6 +553,7 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
     strm_files = list(root.rglob("*.strm")) if root.exists() else []
     LOGGER.info("Cleanup scanning %d .strm files", len(strm_files))
     stale_paths = []
+    deleted_nfos = 0
 
     for p in strm_files:
         kind, payload = check_one(p)
@@ -569,33 +570,70 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
         stale_paths.append(p)
         if apply:
             try:
+                # Delete the .strm file
                 p.unlink()
                 # Remove from manifest
                 path_str = str(p)
                 with _MANIFEST_LOCK:
                     if path_str in manifest_files:
                         del manifest_files[path_str]
+
+                # Delete associated NFO files
+                if typ == "movie":
+                    # Delete movie.nfo in the same folder
+                    nfo_path = p.parent / "movie.nfo"
+                    if nfo_path.exists():
+                        nfo_path.unlink()
+                        deleted_nfos += 1
+                else:  # episode
+                    # Delete S##E##.nfo for this episode
+                    # .strm filename is like "S01E02 - Title.strm", .nfo is "S01E02.nfo"
+                    strm_stem = p.stem  # "S01E02 - Title"
+                    # Extract S##E## pattern
+                    m = re.match(r'(S\d+E\d+)', strm_stem, re.I)
+                    if m:
+                        episode_nfo = p.parent / f"{m.group(1)}.nfo"
+                        if episode_nfo.exists():
+                            episode_nfo.unlink()
+                            deleted_nfos += 1
+
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "deleted", f"stale_{typ}"])
             except Exception as e:
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "error", f"delete_failed: {e}"])
         else:
             rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "would_delete", f"stale_{typ}"])
 
-    # prune empty dirs in apply mode
+    # prune empty dirs and season.nfo files in apply mode
     if apply:
-        pruned = 0
+        pruned_dirs = 0
+        pruned_season_nfos = 0
         # Walk deepest-first
         for d in sorted({p.parent for p in stale_paths}, key=lambda x: len(str(x)), reverse=True):
             try:
+                # Check if season.nfo exists in empty season folder and delete it
+                if d.exists():
+                    season_nfo = d / "season.nfo"
+                    if season_nfo.exists() and not any(f for f in d.iterdir() if f.suffix == '.strm'):
+                        # No .strm files left in season folder, delete season.nfo
+                        season_nfo.unlink()
+                        pruned_season_nfos += 1
+
+                # Delete empty directories
                 cur = d
                 while cur != root and cur.exists() and not any(cur.iterdir()):
                     cur.rmdir()
-                    pruned += 1
+                    pruned_dirs += 1
                     cur = cur.parent
             except Exception:
                 pass
-        rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned)])
-    LOGGER.info("Cleanup finished (apply=%s)", apply)
+
+        if deleted_nfos > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_nfos", str(deleted_nfos)])
+        if pruned_season_nfos > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_season_nfos", str(pruned_season_nfos)])
+        if pruned_dirs > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned_dirs)])
+    LOGGER.info("Cleanup finished (apply=%s, deleted_nfos=%d)", apply, deleted_nfos)
 
 
 # -------------------- Jobs --------------------
@@ -631,6 +669,18 @@ def _run_job_sync(
     rows: List[List[str]] = []
 
     try:
+        # Run cleanup BEFORE generation to remove stale files first
+        # This prevents the bug where newly written files get deleted because
+        # cleanup loads the old manifest before the new one is saved
+        if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
+            if not dry_run:
+                manifest = _load_manifest(root)
+                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
+                # Save updated manifest after cleanup (pruned stale entries)
+                if cleanup_mode == CLEANUP_APPLY:
+                    _save_manifest(root, manifest)
+                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
+
         if mode in ("movies", "all"):
             _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
 
@@ -639,17 +689,6 @@ def _run_job_sync(
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
-
-        if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
-            # Skip cleanup in dry run mode
-            if not dry_run:
-                # Load manifest to prune stale entries
-                manifest = _load_manifest(root)
-                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
-                # Save manifest after pruning (only if files were deleted)
-                if cleanup_mode == CLEANUP_APPLY:
-                    _save_manifest(root, manifest)
-                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
     except Exception as e:  # pragma: no cover
         LOGGER.exception("Job failed: %s", e)
