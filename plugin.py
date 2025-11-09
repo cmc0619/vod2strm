@@ -927,14 +927,14 @@ def _db_stats() -> str:
     return "\n".join(stats)
 
 
-def _db_cleanup(cleanup_type: str, series_id: int = None) -> str:
+def _db_cleanup() -> str:
     """
-    Database cleanup operations using Django ORM.
+    Database cleanup - deletes ALL episodes and episode relations.
     Issue #556 - Quick database cleanup for development/debugging.
 
-    Args:
-        cleanup_type: One of "list", "series", "all_episodes", "all_series", "all_movies"
-        series_id: Required for cleanup_type="series"
+    Replicates these SQL commands in Django ORM:
+        DELETE FROM vod_episode;
+        DELETE FROM vod_m3uepisoderelation;
 
     Returns:
         Formatted string with operation results
@@ -945,101 +945,21 @@ def _db_cleanup(cleanup_type: str, series_id: int = None) -> str:
     results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
 
     try:
-        if cleanup_type == "list":
-            # List series with episode counts
-            series_list = Series.objects.annotate(
-                ep_count=Count('episodes', distinct=True)
-            ).values('id', 'name', 'year', 'ep_count').order_by('-id')[:50]
+        # Count what will be deleted
+        episode_count = Episode.objects.count()
 
-            results.append("SERIES LIST (most recent 50):")
-            results.append(f"{'ID':<8} {'Name':<40} {'Year':<6} {'Episodes':<10}")
-            results.append("-" * 70)
+        results.append(f"Episodes to delete: {episode_count}")
 
-            for s in series_list:
-                name = (s['name'] or 'Unknown')[:40]
-                year = s['year'] or 'N/A'
-                results.append(f"{s['id']:<8} {name:<40} {year:<6} {s['ep_count']:<10}")
-
-            results.append(f"\nTotal series: {Series.objects.count()}")
-            results.append(f"Total episodes: {Episode.objects.count()}")
-
-        elif cleanup_type == "series":
-            # Delete episodes for a specific series
-            if series_id is None:
-                return "ERROR: series_id required for 'series' cleanup type"
-
-            series = Series.objects.filter(id=series_id).first()
-            if not series:
-                return f"ERROR: Series with ID {series_id} not found"
-
-            episode_count = Episode.objects.filter(series_id=series_id).count()
-
-            results.append(f"Series: {series.name} ({series.year or 'N/A'})")
-            results.append(f"Episodes to delete: {episode_count}")
-
-            if episode_count > 0:
-                with transaction.atomic():
-                    # Django ORM cascade delete will handle relations automatically
-                    deleted_count, details = Episode.objects.filter(series_id=series_id).delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-            else:
-                results.append("\nNothing to delete.")
-
-        elif cleanup_type == "all_episodes":
-            # Delete ALL episodes (keeps series)
-            episode_count = Episode.objects.count()
-
-            results.append(f"Total episodes to delete: {episode_count}")
-
-            if episode_count > 0:
-                with transaction.atomic():
-                    deleted_count, details = Episode.objects.all().delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-            else:
-                results.append("\nNothing to delete.")
-
-        elif cleanup_type == "all_series":
-            # Delete ALL series (cascades to episodes)
-            series_count = Series.objects.count()
-            episode_count = Episode.objects.count()
-
-            results.append(f"Series to delete: {series_count}")
-            results.append(f"Episodes to cascade delete: {episode_count}")
-
-            if series_count > 0:
-                with transaction.atomic():
-                    deleted_count, details = Series.objects.all().delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-            else:
-                results.append("\nNothing to delete.")
-
-        elif cleanup_type == "all_movies":
-            # Delete ALL movies
-            movie_count = Movie.objects.count()
-
-            results.append(f"Movies to delete: {movie_count}")
-
-            if movie_count > 0:
-                with transaction.atomic():
-                    deleted_count, details = Movie.objects.all().delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-            else:
-                results.append("\nNothing to delete.")
-
+        if episode_count > 0:
+            with transaction.atomic():
+                # Delete all episodes (cascade deletes will handle M3UEpisodeRelation automatically)
+                deleted_count, details = Episode.objects.all().delete()
+                results.append(f"\n✓ Deleted {deleted_count} objects:")
+                for model, count in details.items():
+                    if count > 0:
+                        results.append(f"  - {model}: {count}")
         else:
-            return f"ERROR: Unknown cleanup type '{cleanup_type}'"
+            results.append("\nNothing to delete.")
 
     except Exception as e:
         LOGGER.exception("Database cleanup failed")
@@ -1156,10 +1076,7 @@ class Plugin:
         {"id": "generate_movies", "label": "Generate Movies"},
         {"id": "generate_series", "label": "Generate Series"},
         {"id": "generate_all", "label": "Generate All"},
-        {"id": "db_cleanup_list", "label": "🗑️ List Series (Cleanup)"},
-        {"id": "db_cleanup_all_episodes", "label": "🗑️ Delete ALL Episodes"},
-        {"id": "db_cleanup_all_series", "label": "🗑️ Delete ALL Series"},
-        {"id": "db_cleanup_all_movies", "label": "🗑️ Delete ALL Movies"},
+        {"id": "db_cleanup", "label": "🗑️ Delete ALL Episodes"},
     ]
 
     def run(self, action_id, params, context):
@@ -1202,38 +1119,14 @@ class Plugin:
                 LOGGER.exception("Database statistics failed")
                 return {"status": "error", "message": f"Failed to generate stats: {e}"}
 
-        # Database cleanup actions (Issue #556)
-        if action == "db_cleanup_list":
+        # Database cleanup (Issue #556) - delete all episodes and episode relations
+        if action == "db_cleanup":
             try:
-                result_text = _db_cleanup("list")
+                result_text = _db_cleanup()
                 return {"status": "ok", "message": result_text}
             except Exception as e:
-                LOGGER.exception("Database cleanup list failed")
-                return {"status": "error", "message": f"Failed to list series: {e}"}
-
-        if action == "db_cleanup_all_episodes":
-            try:
-                result_text = _db_cleanup("all_episodes")
-                return {"status": "ok", "message": result_text}
-            except Exception as e:
-                LOGGER.exception("Database cleanup (all episodes) failed")
+                LOGGER.exception("Database cleanup failed")
                 return {"status": "error", "message": f"Failed to delete episodes: {e}"}
-
-        if action == "db_cleanup_all_series":
-            try:
-                result_text = _db_cleanup("all_series")
-                return {"status": "ok", "message": result_text}
-            except Exception as e:
-                LOGGER.exception("Database cleanup (all series) failed")
-                return {"status": "error", "message": f"Failed to delete series: {e}"}
-
-        if action == "db_cleanup_all_movies":
-            try:
-                result_text = _db_cleanup("all_movies")
-                return {"status": "ok", "message": result_text}
-            except Exception as e:
-                LOGGER.exception("Database cleanup (all movies) failed")
-                return {"status": "error", "message": f"Failed to delete movies: {e}"}
 
         if action == "stats":
             self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
