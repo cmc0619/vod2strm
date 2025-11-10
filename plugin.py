@@ -49,9 +49,10 @@ except Exception:  # pragma: no cover
 
 # Celery (optional; we fall back to threads if not available or not registered)
 try:
-    from celery import current_app as celery_app
+    from celery import current_app as celery_app, shared_task
 except Exception:  # pragma: no cover
     celery_app = None  # type: ignore
+    shared_task = None  # type: ignore
 
 # -------------------- Constants / Defaults --------------------
 
@@ -1271,15 +1272,16 @@ class Plugin:
 
 
 # -------------------- Celery task registration --------------------
-# TEMP: Disabled for testing without Celery workers - remove to re-enable
-if False and celery_app:
-    @celery_app.task(name="plugins.vod2strm.tasks.run_job")
+
+if shared_task:
+    @shared_task(name="plugins.vod2strm.tasks.run_job")
     def celery_run_job(args: dict):
+        """Celery task wrapper for _run_job_sync"""
         _run_job_sync(**args)
 
-    @celery_app.task(name="plugins.vod2strm.tasks.generate_all")
+    @shared_task(name="plugins.vod2strm.tasks.generate_all")
     def celery_generate_all():
-        # Load settings from database for scheduled task
+        """Scheduled Celery task to generate all STRM files"""
         try:
             from apps.plugins.models import PluginConfig
             plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
