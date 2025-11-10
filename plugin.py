@@ -50,10 +50,9 @@ except Exception:  # pragma: no cover
 
 # Celery (optional; we fall back to threads if not available or not registered)
 try:
-    from celery import current_app as celery_app, shared_task
+    from celery import current_app as celery_app
 except Exception:  # pragma: no cover
     celery_app = None  # type: ignore
-    shared_task = None  # type: ignore
 
 # -------------------- Constants / Defaults --------------------
 
@@ -1285,38 +1284,9 @@ class Plugin:
 
 
 # -------------------- Celery task registration --------------------
-
-if shared_task:
-    @shared_task(name="plugins.vod2strm.tasks.run_job")
-    def celery_run_job(args: dict):
-        """Celery task wrapper for _run_job_sync"""
-        _run_job_sync(**args)
-
-    @shared_task(name="plugins.vod2strm.tasks.generate_all")
-    def celery_generate_all():
-        """Scheduled Celery task to generate all STRM files"""
-        try:
-            from apps.plugins.models import PluginConfig
-            plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-            if plugin_config and plugin_config.settings:
-                settings = plugin_config.settings
-            else:
-                settings = {}
-        except Exception as e:
-            LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
-            settings = {}
-
-        _run_job_sync(
-            mode="all",
-            output_root=settings.get("output_root") or DEFAULT_ROOT,
-            base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-            write_nfos=bool(settings.get("write_nfos", True)),
-            cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-            concurrency=int(settings.get("concurrency") or 4),
-            debug_logging=bool(settings.get("debug_logging", False)),
-            dry_run=False,  # Scheduled runs always run for real
-            adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-        )
+# Tasks are defined in tasks.py using @shared_task decorator
+# They are imported in __init__.py to ensure registration when plugin loads
+# This pattern ensures tasks are available to both Django web process and Celery workers
 
 
 # -------------------- Auto-run after VOD refresh --------------------
