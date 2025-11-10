@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import threading
@@ -216,7 +217,7 @@ class AdaptiveThrottle:
             )
         elif avg_write_time < self.fast_threshold and self.current_workers < self.max_workers:
             # NAS is fast, increase workers
-            self.current_workers = min(self.max_workers, int(self.current_workers * self.scale_up_factor))
+            self.current_workers = min(self.max_workers, math.ceil(self.current_workers * self.scale_up_factor))
             if self.current_workers != old_workers:
                 LOGGER.info(
                     "Adaptive throttle: NAS fast (avg %.3fs), increasing workers %d → %d",
