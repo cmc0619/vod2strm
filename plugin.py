@@ -153,10 +153,12 @@ class AdaptiveThrottle:
     Monitors write performance and adjusts concurrency dynamically.
 
     Strategy:
-    - Track average write latency over rolling window
-    - If writes are slow (>200ms), reduce workers
-    - If writes are fast (<50ms), increase workers
-    - Bounds: min=1, max=user_setting
+    - Start conservative with 1 worker, scale up based on performance
+    - Track average write latency over rolling window (20 writes)
+    - If writes are slow (>100ms), cut workers in half
+    - If writes are fast (<30ms), increase workers by 50%
+    - Check every 10 writes for faster response
+    - Bounds: min=1, max=user_setting (capped at 4)
     """
 
     def __init__(self, max_workers: int, enabled: bool = True):
@@ -164,21 +166,22 @@ class AdaptiveThrottle:
         # Even though workers do file I/O, accessing model attributes triggers DB connections
         self.max_workers = min(max_workers, 4)
         self.enabled = enabled
-        self.current_workers = self.max_workers
+        # Start conservative - begin with 1 worker and scale up based on performance
+        self.current_workers = 1 if enabled else self.max_workers
         self.write_times = []  # Rolling window of last N write times
-        self.window_size = 50  # Track last 50 writes
+        self.window_size = 20  # Track last 20 writes (smaller window for faster response)
         self.lock = threading.Lock()
 
-        # Thresholds (in seconds)
-        self.slow_threshold = 0.200  # 200ms
-        self.fast_threshold = 0.050  # 50ms
+        # Thresholds (in seconds) - more aggressive to protect NAS
+        self.slow_threshold = 0.100  # 100ms (down from 200ms)
+        self.fast_threshold = 0.030  # 30ms (down from 50ms)
 
         # Adjustment rates
-        self.scale_down_factor = 0.75  # Reduce by 25% when slow
-        self.scale_up_factor = 1.25    # Increase by 25% when fast
+        self.scale_down_factor = 0.5   # Cut in half when slow (more aggressive)
+        self.scale_up_factor = 1.5     # Increase by 50% when fast (scale up faster)
 
-        # Check interval - adjust every N writes
-        self.check_interval = 50
+        # Check interval - adjust every N writes (smaller for faster response)
+        self.check_interval = 10
         self.writes_since_check = 0
 
     def record_write(self, write_time: float) -> None:
@@ -475,9 +478,12 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         report_rows.append(["movie", "", "", movie_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
+        nfo_start = time.time()
         nfo_path = m_folder / "movie.nfo"
         nfo_bytes = _nfo_movie(movie)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
+        if wrote_nfo and throttle:
+            throttle.record_write(time.time() - nfo_start)
         with lock:
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
@@ -515,16 +521,22 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
             should_write_season = True
 
         if should_write_season:
+            season_start = time.time()
             season_nfo_path = e_folder / "season.nfo"
             season_nfo_bytes = _nfo_season(series, season_number)
             wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
+            if wrote_s and throttle:
+                throttle.record_write(time.time() - season_start)
             with lock:
                 report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
 
         # episode nfo
+        ep_start = time.time()
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
         ep_nfo_bytes = _nfo_episode(episode)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
+        if wrote_e and throttle:
+            throttle.record_write(time.time() - ep_start)
         with lock:
             report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
 
