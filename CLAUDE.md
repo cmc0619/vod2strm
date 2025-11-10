@@ -37,11 +37,13 @@ A high-performance Dispatcharr plugin that exports VOD libraries (Movies and Ser
 
 ## Project Structure
 
-```
+<!-- anchor: project-structure -->
+
+```text
 vod2strm/
 ├── __init__.py              # Plugin registration, exports Plugin class
 ├── plugin.py                # Main plugin implementation (~1400 lines)
-├── claude.md                # This file - project context for Claude
+├── CLAUDE.md                # This file - project context for Claude
 ├── README.md                # User-facing documentation
 └── .claude/
     └── instructions.md      # Session-persistent workflow rules
@@ -153,6 +155,8 @@ class AdaptiveThrottle:
 
 ## Workflow & Git Rules
 
+<!-- anchor: git-workflow -->
+
 ### Branch Strategy
 - **Main branch is protected** - cannot push directly
 - All work happens on feature branches with format: `claude/{description}-{session-id}`
@@ -177,6 +181,8 @@ curl -X POST \
 ```
 
 ## Recent Features & Fixes
+
+<!-- anchor: recent-features -->
 
 ### Database Cleanup Buttons (Issue #556)
 **Location:** `plugin.py:976-1017`
@@ -218,17 +224,74 @@ name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
 
 ## Known Issues & Limitations
 
+<!-- anchor: limitations -->
+
 ### Current Limitations
 - No incremental episode detection (requires manual re-run for new episodes)
 - No provider deduplication (if same content on multiple providers, generates multiple files)
 - No genre-based folder organization
 - Manifest doesn't track file existence (relies on filesystem)
 
-### Critical Bugs to Avoid
-- **DON'T** query `title` field on Movie model (doesn't exist, use `name`)
-- **DON'T** run cleanup AFTER generation (causes race condition, deletes new files)
-- **DON'T** start ThreadPoolExecutor with >4 workers (exhausts Django DB connections)
-- **DON'T** skip manifest save on error (causes files to be regenerated every run)
+## Protected Areas (Do NOT Touch)
+
+<!-- anchor: protected-areas -->
+
+**Critical Code - Modify with Extreme Caution:**
+
+These areas should NOT be modified by AI without explicit user approval:
+
+### Database Models
+- Never modify Django model field names (Movie, Series, Episode)
+- Model fields are defined by Dispatcharr, not this plugin
+- Always use `getattr(obj, 'field', default)` to safely access fields
+- **Known safe fields:**
+  - Movie: `name`, `year`, `uuid`, `tmdb_id`, `imdb_id`
+  - Series: `name`, `year`, `uuid`, `tmdb_id`
+  - Episode: `name`, `season_number`, `episode_number`, `uuid`
+
+### Manifest File Structure
+- The manifest JSON schema is critical for caching logic
+- Changes to manifest format require migration logic
+- Current schema: `{"version": 1, "files": {...}}`
+
+### Threading & Concurrency
+- ThreadPoolExecutor worker limits (max 4) prevent DB connection exhaustion
+- Adaptive throttling algorithm carefully tuned for NAS protection
+- Lock usage patterns prevent race conditions
+
+### Celery Task Registration
+- Task names must match what's called in `_enqueue()`: `plugins.vod2strm.tasks.run_job`
+- `@shared_task` decorator pattern is required for Dispatcharr's autodiscovery
+- Don't change task signatures without updating callers
+
+## Things NOT to Do
+
+<!-- anchor: things-not-to-do -->
+
+**Critical Rules - Violations Will Break Production:**
+
+### Model/Database
+- ❌ **NEVER** query `title` field on Movie model (doesn't exist, use `name`)
+- ❌ **NEVER** modify or delete from Dispatcharr's database (read-only plugin)
+- ❌ **NEVER** use raw SQL queries (use Django ORM only)
+- ❌ **NEVER** assume fields exist (use `getattr(obj, 'field', default)`)
+
+### File Operations
+- ❌ **NEVER** run cleanup AFTER generation (causes race condition, deletes new files)
+- ❌ **NEVER** skip manifest save on error (causes files to be regenerated every run)
+- ❌ **NEVER** write files outside the configured output_root
+- ❌ **NEVER** use string concatenation for paths (use `Path` objects)
+
+### Threading/Concurrency
+- ❌ **NEVER** start ThreadPoolExecutor with >4 workers (exhausts Django DB connections)
+- ❌ **NEVER** modify shared state without locks (manifest, report_rows)
+- ❌ **NEVER** block the main Django thread (use Celery or threading)
+
+### Git/Deployment
+- ❌ **NEVER** merge to main without explicit user approval
+- ❌ **NEVER** push directly to main (branch is protected)
+- ❌ **NEVER** commit secrets or tokens to the repository
+- ❌ **NEVER** modify version numbers without user request
 
 ## Future Development
 
