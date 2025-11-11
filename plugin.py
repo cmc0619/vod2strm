@@ -55,7 +55,8 @@ try:
 except Exception:  # pragma: no cover
     from vod.models import Movie, Series, Episode  # type: ignore
 
-# Celery (optional; we fall back to threads if not available or not registered)
+# Celery (required - Dispatcharr depends on Celery to function)
+# Import is in try/except for testing purposes only
 try:
     from celery import current_app as celery_app
     from celery import shared_task
@@ -1280,20 +1281,20 @@ class Plugin:
             "adaptive_throttle": adaptive_throttle,
         }
 
-        # Try Celery if available
-        if celery_app and celery_run_job is not None:
-            try:
-                # Call the task using delay() - standard Celery pattern
-                celery_run_job.delay(args)
-                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
-                return
-            except Exception as e:
-                LOGGER.warning("Failed to enqueue Celery task: %s. Falling back to threading.", e)
+        # REASONING: Threading fallback removed
+        # This plugin runs inside Dispatcharr, which requires Celery to function.
+        # If Celery is unavailable, Dispatcharr itself won't be running, so there's
+        # no scenario where this plugin is active but Celery is down.
+        # Removing the threading fallback simplifies the code and removes unnecessary
+        # complexity for a scenario that cannot occur in production.
 
-        # Fallback to background thread
-        LOGGER.info("Running in background thread (Celery not available or failed).")
-        t = threading.Thread(target=_run_job_sync, name=f"vod2strm-{mode}", kwargs=args, daemon=True)
-        t.start()
+        if not celery_app or celery_run_job is None:
+            LOGGER.error("Celery not available - cannot enqueue background task. This should not happen if Dispatcharr is running correctly.")
+            return
+
+        # Call the task using delay() - standard Celery pattern
+        celery_run_job.delay(args)
+        LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
 
 
 # -------------------- Celery task registration --------------------
