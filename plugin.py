@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.2
+Version: 0.0.3
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -51,8 +51,10 @@ except Exception:  # pragma: no cover
 # Celery (optional; we fall back to threads if not available or not registered)
 try:
     from celery import current_app as celery_app
+    from celery import shared_task
 except Exception:  # pragma: no cover
     celery_app = None  # type: ignore
+    shared_task = None  # type: ignore
 
 # -------------------- Constants / Defaults --------------------
 
@@ -1054,7 +1056,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.2"
+    version = "0.0.3"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1284,9 +1286,61 @@ class Plugin:
 
 
 # -------------------- Celery task registration --------------------
-# Tasks are defined in tasks.py using @shared_task decorator
-# They are imported in __init__.py to ensure registration when plugin loads
-# This pattern ensures tasks are available to both Django web process and Celery workers
+# Tasks are defined here with @shared_task decorator
+# When the plugin module is imported, these decorators execute and register the tasks
+
+if shared_task:
+    @shared_task(name="plugins.vod2strm.tasks.run_job", bind=False)
+    def celery_run_job(args: dict):
+        """
+        Celery task for background STRM generation.
+
+        Args:
+            args: Dictionary of arguments to pass to _run_job_sync
+        """
+        LOGGER.info("Celery task run_job starting with args: %s", args)
+        try:
+            _run_job_sync(**args)
+            LOGGER.info("Celery task run_job completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
+            raise
+
+    @shared_task(name="plugins.vod2strm.tasks.generate_all", bind=False)
+    def celery_generate_all():
+        """
+        Scheduled Celery task to generate all STRM files.
+
+        Loads settings from database and runs full generation.
+        """
+        try:
+            from apps.plugins.models import PluginConfig
+            plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+            if plugin_config and plugin_config.settings:
+                settings = plugin_config.settings
+            else:
+                settings = {}
+        except Exception as e:
+            LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
+            settings = {}
+
+        LOGGER.info("Celery scheduled task generate_all starting")
+        try:
+            _run_job_sync(
+                mode="all",
+                output_root=settings.get("output_root") or DEFAULT_ROOT,
+                base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+                write_nfos=bool(settings.get("write_nfos", True)),
+                cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+                concurrency=int(settings.get("concurrency", 4)),
+                adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                debug_logging=bool(settings.get("debug_logging", False)),
+                dry_run=False,  # Scheduled runs always run for real
+            )
+            LOGGER.info("Celery scheduled task generate_all completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
+            raise
 
 
 # -------------------- Auto-run after VOD refresh --------------------
