@@ -260,8 +260,10 @@ These areas should NOT be modified by AI without explicit user approval:
 - Lock usage patterns prevent race conditions
 
 ### Celery Task Registration
-- Task names must match what's called in `_enqueue()`: `plugins.vod2strm.tasks.run_job`
-- `@shared_task` decorator pattern is required for Dispatcharr's autodiscovery
+- Task names must match the actual import path: `vod2strm.plugin.run_job` (not `plugins.vod2strm.tasks.run_job`)
+- Plugin module is added to Celery's imports configuration at module load time
+- Tasks are registered with `celery_app.task()` directly in plugin.py
+- Celery workers must be restarted after plugin installation to pick up new tasks
 - Don't change task signatures without updating callers
 
 ## Things NOT to Do

@@ -1241,7 +1241,7 @@ class Plugin:
                 hhmm = sched.split(" ", 1)[1].strip() if " " in sched else "03:30"
                 hour, minute = [int(x) for x in hhmm.split(":")]
                 celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "plugins.vod2strm.tasks.generate_all",
+                    "task": "vod2strm.plugin.generate_all",
                     "schedule": {"type": "crontab", "hour": hour, "minute": minute},
                     "args": [],
                 }
@@ -1255,7 +1255,7 @@ class Plugin:
                 else:
                     raise ValueError("Invalid schedule format")
                 celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "plugins.vod2strm.tasks.generate_all",
+                    "task": "vod2strm.plugin.generate_all",
                     "schedule": {
                         "type": "crontab",
                         "minute": minute, "hour": hour,
@@ -1285,11 +1285,9 @@ class Plugin:
             try:
                 # Use send_task to queue the job - worker will import plugin to execute it
                 celery_app.send_task(
-                    "plugins.vod2strm.tasks.run_job",
+                    "vod2strm.plugin.run_job",
                     args=[args],
                     queue="default",
-                    # Add routing to ensure worker can find the module
-                    headers={'plugin_module': 'plugins.vod2strm.plugin'}
                 )
                 LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
                 return
@@ -1360,17 +1358,27 @@ def _celery_generate_all_impl():
 # Register tasks with Celery app at module import time
 if celery_app:
     try:
+        # Add this module to Celery's imports so workers will load it
+        # The module path is 'vod2strm.plugin' because /data/plugins is in sys.path
+        plugin_module = 'vod2strm.plugin'
+        current_imports = list(celery_app.conf.get('imports', []))
+        if plugin_module not in current_imports:
+            current_imports.append(plugin_module)
+            celery_app.conf.update(imports=current_imports)
+            LOGGER.info(f"Added {plugin_module} to Celery imports (workers may need restart)")
+
+        # Register tasks with names that match the actual import path
         celery_run_job = celery_app.task(
             _celery_run_job_impl,
-            name="plugins.vod2strm.tasks.run_job",
+            name="vod2strm.plugin.run_job",
             bind=False
         )
         celery_generate_all = celery_app.task(
             _celery_generate_all_impl,
-            name="plugins.vod2strm.tasks.generate_all",
+            name="vod2strm.plugin.generate_all",
             bind=False
         )
-        LOGGER.info("Registered Celery tasks: plugins.vod2strm.tasks.run_job, plugins.vod2strm.tasks.generate_all")
+        LOGGER.info("Registered Celery tasks: vod2strm.plugin.run_job, vod2strm.plugin.generate_all")
     except Exception as e:
         LOGGER.warning("Failed to register Celery tasks: %s. Will use threading fallback.", e)
 
