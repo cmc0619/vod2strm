@@ -226,6 +226,26 @@ name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
 
 <!-- anchor: limitations -->
 
+### Dispatcharr Bug Workarounds
+
+The plugin includes defensive code to handle known Dispatcharr bugs:
+
+**Issue #556: Episodes Disappear After Sync**
+- **Problem**: Duplicate key constraint violation `vod_episode_series_id_season_number__73053ba7_uniq` causes episodes to be deleted during VOD refresh
+- **Workaround**:
+  - Catch duplicate key errors during `refresh_series_episodes()` and skip to next provider
+  - Validate episode still exists in DB before writing STRM file
+  - Log warnings when episodes vanish mid-generation
+  - Skip vanished episodes gracefully instead of crashing
+
+**Issue #569: Multiple M3UEpisodeRelation Records**
+- **Problem**: `get() returned more than one M3UEpisodeRelation` when same episode has multiple stream sources
+- **Workaround**:
+  - Use `.distinct()` on all episode queries to deduplicate
+  - Log warnings when duplicate relations detected
+  - Use highest priority provider when multiple relations exist
+  - Track relation count before/after distinct to detect duplicates
+
 ### Current Limitations
 - No incremental episode detection (requires manual re-run for new episodes)
 - No provider deduplication (if same content on multiple providers, generates multiple files)
