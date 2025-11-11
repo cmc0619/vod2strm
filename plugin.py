@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.2
+Version: 0.0.3
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -21,12 +21,20 @@ Spec:
 
 from __future__ import annotations
 
+# Ensure plugin directory is in sys.path so Celery workers can import this module
+import sys
+from pathlib import Path
+_plugin_parent = Path(__file__).parent.parent
+if str(_plugin_parent) not in sys.path:
+    sys.path.insert(0, str(_plugin_parent))
+
 import csv
 import hashlib
 import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import threading
@@ -50,8 +58,10 @@ except Exception:  # pragma: no cover
 # Celery (optional; we fall back to threads if not available or not registered)
 try:
     from celery import current_app as celery_app
+    from celery import shared_task
 except Exception:  # pragma: no cover
     celery_app = None  # type: ignore
+    shared_task = None  # type: ignore
 
 # -------------------- Constants / Defaults --------------------
 
@@ -152,10 +162,12 @@ class AdaptiveThrottle:
     Monitors write performance and adjusts concurrency dynamically.
 
     Strategy:
-    - Track average write latency over rolling window
-    - If writes are slow (>200ms), reduce workers
-    - If writes are fast (<50ms), increase workers
-    - Bounds: min=1, max=user_setting
+    - Start conservative with 1 worker, scale up based on performance
+    - Track average write latency over rolling window (20 writes)
+    - If writes are slow (>100ms), cut workers in half
+    - If writes are fast (<30ms), increase workers by 50%
+    - Check every 10 writes for faster response
+    - Bounds: min=1, max=user_setting (capped at 4)
     """
 
     def __init__(self, max_workers: int, enabled: bool = True):
@@ -163,21 +175,22 @@ class AdaptiveThrottle:
         # Even though workers do file I/O, accessing model attributes triggers DB connections
         self.max_workers = min(max_workers, 4)
         self.enabled = enabled
-        self.current_workers = self.max_workers
+        # Start conservative - begin with 1 worker and scale up based on performance
+        self.current_workers = 1 if enabled else self.max_workers
         self.write_times = []  # Rolling window of last N write times
-        self.window_size = 50  # Track last 50 writes
+        self.window_size = 20  # Track last 20 writes (smaller window for faster response)
         self.lock = threading.Lock()
 
-        # Thresholds (in seconds)
-        self.slow_threshold = 0.200  # 200ms
-        self.fast_threshold = 0.050  # 50ms
+        # Thresholds (in seconds) - more aggressive to protect NAS
+        self.slow_threshold = 0.100  # 100ms (down from 200ms)
+        self.fast_threshold = 0.030  # 30ms (down from 50ms)
 
         # Adjustment rates
-        self.scale_down_factor = 0.75  # Reduce by 25% when slow
-        self.scale_up_factor = 1.25    # Increase by 25% when fast
+        self.scale_down_factor = 0.5   # Cut in half when slow (more aggressive)
+        self.scale_up_factor = 1.5     # Increase by 50% when fast (scale up faster)
 
-        # Check interval - adjust every N writes
-        self.check_interval = 50
+        # Check interval - adjust every N writes (smaller for faster response)
+        self.check_interval = 10
         self.writes_since_check = 0
 
     def record_write(self, write_time: float) -> None:
@@ -212,7 +225,7 @@ class AdaptiveThrottle:
             )
         elif avg_write_time < self.fast_threshold and self.current_workers < self.max_workers:
             # NAS is fast, increase workers
-            self.current_workers = min(self.max_workers, int(self.current_workers * self.scale_up_factor))
+            self.current_workers = min(self.max_workers, math.ceil(self.current_workers * self.scale_up_factor))
             if self.current_workers != old_workers:
                 LOGGER.info(
                     "Adaptive throttle: NAS fast (avg %.3fs), increasing workers %d → %d",
@@ -474,9 +487,12 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         report_rows.append(["movie", "", "", movie_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
+        nfo_start = time.time()
         nfo_path = m_folder / "movie.nfo"
         nfo_bytes = _nfo_movie(movie)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
+        if wrote_nfo and throttle:
+            throttle.record_write(time.time() - nfo_start)
         with lock:
             report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
@@ -514,16 +530,22 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
             should_write_season = True
 
         if should_write_season:
+            season_start = time.time()
             season_nfo_path = e_folder / "season.nfo"
             season_nfo_bytes = _nfo_season(series, season_number)
             wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
+            if wrote_s and throttle:
+                throttle.record_write(time.time() - season_start)
             with lock:
                 report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
 
         # episode nfo
+        ep_start = time.time()
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
         ep_nfo_bytes = _nfo_episode(episode)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
+        if wrote_e and throttle:
+            throttle.record_write(time.time() - ep_start)
         with lock:
             report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
 
@@ -1041,7 +1063,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.2"
+    version = "0.0.3"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1219,7 +1241,7 @@ class Plugin:
                 hhmm = sched.split(" ", 1)[1].strip() if " " in sched else "03:30"
                 hour, minute = [int(x) for x in hhmm.split(":")]
                 celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "plugins.vod2strm.tasks.generate_all",
+                    "task": "vod2strm.plugin.generate_all",
                     "schedule": {"type": "crontab", "hour": hour, "minute": minute},
                     "args": [],
                 }
@@ -1233,7 +1255,7 @@ class Plugin:
                 else:
                     raise ValueError("Invalid schedule format")
                 celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "plugins.vod2strm.tasks.generate_all",
+                    "task": "vod2strm.plugin.generate_all",
                     "schedule": {
                         "type": "crontab",
                         "minute": minute, "hour": hour,
@@ -1258,28 +1280,52 @@ class Plugin:
             "adaptive_throttle": adaptive_throttle,
         }
 
-        # Prefer Celery if our task is registered
-        if celery_app and "plugins.vod2strm.tasks.run_job" in celery_app.tasks:
-            celery_app.send_task("plugins.vod2strm.tasks.run_job", args=[args], queue="default")
-            LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
-            return
+        # Try Celery if available
+        if celery_app and celery_run_job is not None:
+            try:
+                # Call the task using delay() - standard Celery pattern
+                celery_run_job.delay(args)
+                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
+                return
+            except Exception as e:
+                LOGGER.warning("Failed to enqueue Celery task: %s. Falling back to threading.", e)
 
         # Fallback to background thread
-        LOGGER.warning("Celery task not registered; running in a background thread (fallback).")
+        LOGGER.info("Running in background thread (Celery not available or failed).")
         t = threading.Thread(target=_run_job_sync, name=f"vod2strm-{mode}", kwargs=args, daemon=True)
         t.start()
 
 
 # -------------------- Celery task registration --------------------
-# TEMP: Disabled for testing without Celery workers - remove to re-enable
-if False and celery_app:
-    @celery_app.task(name="plugins.vod2strm.tasks.run_job")
-    def celery_run_job(args: dict):
-        _run_job_sync(**args)
+# Register tasks dynamically with Celery app at module import time
+# This ensures tasks are registered in both Django process and Celery workers
 
-    @celery_app.task(name="plugins.vod2strm.tasks.generate_all")
+# Define and register Celery tasks using @shared_task decorator
+# This is the standard Django/Celery pattern that works with autodiscovery
+
+# Only define tasks if shared_task is available
+if shared_task is not None:
+    @shared_task(name="vod2strm.plugin.run_job")
+    def celery_run_job(args: dict):
+        """
+        Celery task for background STRM generation.
+        Worker process imports this module via autodiscovery.
+        """
+        LOGGER.info("Celery task run_job starting with args: %s", args)
+        try:
+            _run_job_sync(**args)
+            LOGGER.info("Celery task run_job completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
+            raise
+
+
+    @shared_task(name="vod2strm.plugin.generate_all")
     def celery_generate_all():
-        # Load settings from database for scheduled task
+        """
+        Celery task for scheduled STRM generation.
+        Worker process imports this module via autodiscovery.
+        """
         try:
             from apps.plugins.models import PluginConfig
             plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
@@ -1291,17 +1337,39 @@ if False and celery_app:
             LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
             settings = {}
 
-        _run_job_sync(
-            mode="all",
-            output_root=settings.get("output_root") or DEFAULT_ROOT,
-            base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-            write_nfos=bool(settings.get("write_nfos", True)),
-            cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-            concurrency=int(settings.get("concurrency") or 4),
-            debug_logging=bool(settings.get("debug_logging", False)),
-            dry_run=False,  # Scheduled runs always run for real
-            adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-        )
+        LOGGER.info("Celery scheduled task generate_all starting")
+        try:
+            _run_job_sync(
+                mode="all",
+                output_root=settings.get("output_root") or DEFAULT_ROOT,
+                base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+                write_nfos=bool(settings.get("write_nfos", True)),
+                cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+                concurrency=int(settings.get("concurrency", 4)),
+                adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                debug_logging=bool(settings.get("debug_logging", False)),
+                dry_run=False,  # Scheduled runs always run for real
+            )
+            LOGGER.info("Celery scheduled task generate_all completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
+            raise
+
+    # Add this module to Celery imports so workers will autodiscover our tasks
+    if celery_app:
+        try:
+            plugin_module = 'vod2strm.plugin'
+            current_imports = list(celery_app.conf.get('imports', []))
+            if plugin_module not in current_imports:
+                current_imports.append(plugin_module)
+                celery_app.conf.update(imports=current_imports)
+                LOGGER.info(f"Added {plugin_module} to Celery imports - tasks will be available after worker restart")
+        except Exception as e:
+            LOGGER.warning("Failed to add module to Celery imports: %s", e)
+else:
+    # Celery not available - define placeholder functions
+    celery_run_job = None
+    celery_generate_all = None
 
 
 # -------------------- Auto-run after VOD refresh --------------------
