@@ -498,6 +498,26 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
 
 
 def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None) -> None:
+    # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
+    # Episodes can disappear mid-generation due to sync conflicts
+    try:
+        episode_exists = Episode.objects.filter(id=episode.id).exists()
+        if not episode_exists:
+            title = getattr(episode, "name", "") or ""
+            season_number = getattr(episode, "season_number", 0) or 0
+            LOGGER.warning(
+                "Dispatcharr issue #556: Episode id=%s (S%02dE%02d - %s) vanished from database during generation. Skipping.",
+                episode.id,
+                season_number,
+                getattr(episode, "episode_number", 0) or 0,
+                title
+            )
+            with lock:
+                report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", "", "skipped", "episode_vanished"])
+            return
+    except Exception as validation_error:
+        LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
+
     s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
@@ -792,6 +812,15 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
             LOGGER.debug("Series id=%s has no active M3U account relations", series.id)
             return False
 
+        # Workaround for Dispatcharr issue #569: Multiple M3UEpisodeRelation records
+        relation_count = relations.count()
+        if relation_count > 1:
+            LOGGER.warning(
+                "Series id=%s has %d M3U relations (Dispatcharr issue #569). Using highest priority provider only.",
+                series.id,
+                relation_count
+            )
+
         # Try each provider in priority order
         for relation in relations:
             LOGGER.info(
@@ -801,12 +830,33 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
                 relation.m3u_account.priority
             )
 
-            # Call refresh directly (synchronous, matching UI pattern)
-            refresh_series_episodes(
-                relation.m3u_account,
-                series,
-                relation.external_series_id
-            )
+            try:
+                # Call refresh directly (synchronous, matching UI pattern)
+                # Workaround for Dispatcharr issue #556: Catch duplicate key errors during refresh
+                refresh_series_episodes(
+                    relation.m3u_account,
+                    series,
+                    relation.external_series_id
+                )
+            except Exception as refresh_error:
+                # Check if this is the duplicate key constraint error from issue #556
+                error_str = str(refresh_error)
+                if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
+                    LOGGER.warning(
+                        "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
+                        "Episodes may have disappeared during sync. Skipping this provider.",
+                        series.id
+                    )
+                    continue
+                else:
+                    # Different error - log and try next provider
+                    LOGGER.warning(
+                        "Episode refresh error for series_id=%s from provider %s: %s",
+                        series.id,
+                        relation.m3u_account.name,
+                        refresh_error
+                    )
+                    continue
 
             # Check if we got episodes
             episode_count = Episode.objects.filter(series_id=series.id).count()
@@ -875,13 +925,29 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 continue
 
             # Only generate episodes that have active provider relations
-            eps = list(Episode.objects.filter(
+            # Workaround for Dispatcharr issue #569: Use .distinct() to handle duplicate M3UEpisodeRelation records
+            eps_query = Episode.objects.filter(
                 series_id=s.id,
                 m3u_relations__m3u_account__is_active=True
-            ).distinct().only(
+            )
+
+            # Check for duplicate relations (issue #569 detection)
+            total_before_distinct = eps_query.count()
+            eps = list(eps_query.distinct().only(
                 "id", "uuid", "name", "season_number", "episode_number",
                 "air_date", "description", "rating", "tmdb_id", "imdb_id"
             ).order_by("season_number", "episode_number"))
+            total_after_distinct = len(eps)
+
+            if total_before_distinct > total_after_distinct:
+                LOGGER.warning(
+                    "Dispatcharr issue #569: Series '%s' (id=%s) has duplicate M3U relations. "
+                    "Found %d episode relations but only %d unique episodes. Using distinct episodes only.",
+                    s.name,
+                    s.id,
+                    total_before_distinct,
+                    total_after_distinct
+                )
 
             if not eps:
                 with lock:
