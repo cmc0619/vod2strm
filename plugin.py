@@ -1281,14 +1281,10 @@ class Plugin:
         }
 
         # Try Celery if available
-        if celery_app:
+        if celery_app and celery_run_job is not None:
             try:
-                # Use send_task to queue the job - worker will import plugin to execute it
-                celery_app.send_task(
-                    "vod2strm.plugin.run_job",
-                    args=[args],
-                    queue="default",
-                )
+                # Call the task using delay() - standard Celery pattern
+                celery_run_job.delay(args)
                 LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
                 return
             except Exception as e:
@@ -1304,83 +1300,76 @@ class Plugin:
 # Register tasks dynamically with Celery app at module import time
 # This ensures tasks are registered in both Django process and Celery workers
 
-# Define task functions that will be registered with Celery
-# These call the plugin's _run_job_sync function
-def _celery_run_job_impl(args: dict):
-    """
-    Celery task implementation for background STRM generation.
-    Worker process will import this module to execute this function.
-    """
-    LOGGER.info("Celery task run_job starting with args: %s", args)
-    try:
-        _run_job_sync(**args)
-        LOGGER.info("Celery task run_job completed successfully")
-    except Exception as e:
-        LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
-        raise
+# Define and register Celery tasks using @shared_task decorator
+# This is the standard Django/Celery pattern that works with autodiscovery
+
+# Only define tasks if shared_task is available
+if shared_task is not None:
+    @shared_task(name="vod2strm.plugin.run_job")
+    def celery_run_job(args: dict):
+        """
+        Celery task for background STRM generation.
+        Worker process imports this module via autodiscovery.
+        """
+        LOGGER.info("Celery task run_job starting with args: %s", args)
+        try:
+            _run_job_sync(**args)
+            LOGGER.info("Celery task run_job completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
+            raise
 
 
-def _celery_generate_all_impl():
-    """
-    Celery task implementation for scheduled STRM generation.
-    Worker process will import this module to execute this function.
-    """
-    try:
-        from apps.plugins.models import PluginConfig
-        plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-        if plugin_config and plugin_config.settings:
-            settings = plugin_config.settings
-        else:
+    @shared_task(name="vod2strm.plugin.generate_all")
+    def celery_generate_all():
+        """
+        Celery task for scheduled STRM generation.
+        Worker process imports this module via autodiscovery.
+        """
+        try:
+            from apps.plugins.models import PluginConfig
+            plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+            if plugin_config and plugin_config.settings:
+                settings = plugin_config.settings
+            else:
+                settings = {}
+        except Exception as e:
+            LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
             settings = {}
-    except Exception as e:
-        LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
-        settings = {}
 
-    LOGGER.info("Celery scheduled task generate_all starting")
-    try:
-        _run_job_sync(
-            mode="all",
-            output_root=settings.get("output_root") or DEFAULT_ROOT,
-            base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-            write_nfos=bool(settings.get("write_nfos", True)),
-            cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-            concurrency=int(settings.get("concurrency", 4)),
-            adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-            debug_logging=bool(settings.get("debug_logging", False)),
-            dry_run=False,  # Scheduled runs always run for real
-        )
-        LOGGER.info("Celery scheduled task generate_all completed successfully")
-    except Exception as e:
-        LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
-        raise
+        LOGGER.info("Celery scheduled task generate_all starting")
+        try:
+            _run_job_sync(
+                mode="all",
+                output_root=settings.get("output_root") or DEFAULT_ROOT,
+                base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+                write_nfos=bool(settings.get("write_nfos", True)),
+                cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+                concurrency=int(settings.get("concurrency", 4)),
+                adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                debug_logging=bool(settings.get("debug_logging", False)),
+                dry_run=False,  # Scheduled runs always run for real
+            )
+            LOGGER.info("Celery scheduled task generate_all completed successfully")
+        except Exception as e:
+            LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
+            raise
 
-
-# Register tasks with Celery app at module import time
-if celery_app:
-    try:
-        # Add this module to Celery's imports so workers will load it
-        # The module path is 'vod2strm.plugin' because /data/plugins is in sys.path
-        plugin_module = 'vod2strm.plugin'
-        current_imports = list(celery_app.conf.get('imports', []))
-        if plugin_module not in current_imports:
-            current_imports.append(plugin_module)
-            celery_app.conf.update(imports=current_imports)
-            LOGGER.info(f"Added {plugin_module} to Celery imports (workers may need restart)")
-
-        # Register tasks with names that match the actual import path
-        celery_run_job = celery_app.task(
-            _celery_run_job_impl,
-            name="vod2strm.plugin.run_job",
-            bind=False
-        )
-        celery_generate_all = celery_app.task(
-            _celery_generate_all_impl,
-            name="vod2strm.plugin.generate_all",
-            bind=False
-        )
-        LOGGER.info("Registered Celery tasks: vod2strm.plugin.run_job, vod2strm.plugin.generate_all")
-    except Exception as e:
-        LOGGER.warning("Failed to register Celery tasks: %s. Will use threading fallback.", e)
+    # Add this module to Celery imports so workers will autodiscover our tasks
+    if celery_app:
+        try:
+            plugin_module = 'vod2strm.plugin'
+            current_imports = list(celery_app.conf.get('imports', []))
+            if plugin_module not in current_imports:
+                current_imports.append(plugin_module)
+                celery_app.conf.update(imports=current_imports)
+                LOGGER.info(f"Added {plugin_module} to Celery imports - tasks will be available after worker restart")
+        except Exception as e:
+            LOGGER.warning("Failed to add module to Celery imports: %s", e)
+else:
+    # Celery not available - define placeholder functions
+    celery_run_job = None
+    celery_generate_all = None
 
 
 # -------------------- Auto-run after VOD refresh --------------------
