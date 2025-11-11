@@ -260,10 +260,11 @@ These areas should NOT be modified by AI without explicit user approval:
 - Lock usage patterns prevent race conditions
 
 ### Celery Task Registration
-- Task names must match the actual import path: `vod2strm.plugin.run_job` (not `plugins.vod2strm.tasks.run_job`)
+- Uses `@shared_task` decorator - the standard Django/Celery pattern for plugins
+- Task names match the actual import path: `vod2strm.plugin.run_job`
 - Plugin module is added to Celery's imports configuration at module load time
-- Tasks are registered with `celery_app.task()` directly in plugin.py
-- Celery workers must be restarted after plugin installation to pick up new tasks
+- Tasks auto-register when workers import the plugin module
+- Workers must be restarted after plugin installation/updates to pick up changes
 - Don't change task signatures without updating callers
 
 ## Things NOT to Do
