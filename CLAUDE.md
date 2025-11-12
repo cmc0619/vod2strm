@@ -153,6 +153,57 @@ class AdaptiveThrottle:
 
 **Critical Fix:** Cleanup runs BEFORE generation (not after) to prevent race condition where new files get deleted immediately after creation.
 
+### Scheduled Tasks with Celery Beat (`plugin.py:1230-1268`)
+
+**Implementation Pattern:**
+
+This plugin implements scheduled STRM generation using Celery Beat with programmatic task registration (not Django's PeriodicTask model).
+
+**How It Works:**
+
+1. **Task Definition**: Use `@shared_task` decorator to define the scheduled task function:
+```python
+@shared_task(name="vod2strm.plugin.generate_all")
+def celery_generate_all():
+    # Load settings from database
+    # Execute _run_job_sync with mode="all"
+```
+
+2. **Schedule Registration**: Configure Celery Beat schedule programmatically in `Plugin.ready()`:
+```python
+celery_app.conf.beat_schedule["vod2strm.periodic_generate_all"] = {
+    "task": "vod2strm.plugin.generate_all",
+    "schedule": {"type": "crontab", "hour": 3, "minute": 30},
+    "args": []
+}
+```
+
+3. **Settings Loading**: Scheduled tasks load their own settings from PluginConfig database:
+```python
+plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+settings = plugin_config.settings if plugin_config else {}
+```
+
+**Key Learnings from EPG Scheduler Plugin:**
+
+- Other scheduler plugins (like EPG refresh) use a different approach - they create Django `PeriodicTask` model instances to schedule **existing** Dispatcharr tasks
+- Our plugin defines **custom** tasks using `@shared_task`, giving us more control over execution
+- Scheduled tasks must be self-contained - they can't rely on user-provided parameters, so they load settings from the database
+- Always set `dry_run=False` for scheduled runs (user wouldn't schedule dry runs)
+
+**Schedule Format Support:**
+
+- **Simple**: `"daily 03:30"` - runs at 3:30 AM every day
+- **Crontab**: `"0 3 * * *"` - standard 5-field cron syntax
+- **Extended**: `"0 0 3 * * *"` - 6-field with seconds
+
+**Important Notes:**
+
+- Workers must be restarted after plugin installation for beat schedules to register
+- Schedule registration happens in `Plugin.ready()` which runs on Django startup
+- Task names must match exactly: `"vod2strm.plugin.generate_all"` → `celery_generate_all` function
+- Beat scheduler is a separate process from workers (`celery beat` vs `celery worker`)
+
 ## Workflow & Git Rules
 
 <!-- anchor: git-workflow -->
