@@ -46,14 +46,28 @@ from typing import Iterable, List, Tuple, Dict, Any
 
 from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
 from django.db import transaction  # noqa:F401
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef, Q
 from django.utils.timezone import now  # noqa:F401
 
 # ORM models (plugin runs in-process with the app)
 try:
-    from apps.vod.models import Movie, Series, Episode
+    from apps.vod.models import (
+        Movie,
+        Series,
+        Episode,
+        M3UMovieRelation,
+        M3USeriesRelation,
+        M3UVODCategoryRelation,
+    )
 except Exception:  # pragma: no cover
-    from vod.models import Movie, Series, Episode  # type: ignore
+    from vod.models import (  # type: ignore
+        Movie,
+        Series,
+        Episode,
+        M3UMovieRelation,
+        M3USeriesRelation,
+        M3UVODCategoryRelation,
+    )
 
 # Celery (optional; we fall back to threads if not available or not registered)
 try:
@@ -87,6 +101,48 @@ if not LOGGER.handlers:
 _FILE_LOGGER_CONFIGURED = False
 _LOG_LOCK = threading.Lock()
 _MANIFEST_LOCK = threading.Lock()  # Protects manifest dict from concurrent modification
+
+
+# -------------------- Query Helpers --------------------
+
+def _enabled_category_subquery(account_field: str, category_field: str) -> Exists:
+    """
+    Build an Exists() subquery that ensures a given account/category pair is enabled.
+    account_field/category_field refer to columns available on the outer queryset.
+    """
+    return Exists(
+        M3UVODCategoryRelation.objects.filter(
+            m3u_account_id=OuterRef(account_field),
+            category_id=OuterRef(category_field),
+            enabled=True,
+        )
+    )
+
+
+def _eligible_movie_queryset():
+    """
+    Movies that have at least one active account relation and belong to an enabled group.
+    """
+    allowed_relations = M3UMovieRelation.objects.filter(
+        movie_id=OuterRef("pk"),
+        m3u_account__is_active=True,
+    ).filter(
+        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+    )
+    return Movie.objects.annotate(_vod2_allowed_movie=Exists(allowed_relations)).filter(_vod2_allowed_movie=True)
+
+
+def _eligible_series_queryset():
+    """
+    Series that have at least one active account relation and belong to an enabled group.
+    """
+    allowed_relations = M3USeriesRelation.objects.filter(
+        series_id=OuterRef("pk"),
+        m3u_account__is_active=True,
+    ).filter(
+        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+    )
+    return Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
 
 
 def _ensure_dirs() -> None:
@@ -559,8 +615,11 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
     manifest_files = manifest.get("files", {})
-    movie_uuids = set(Movie.objects.values_list("uuid", flat=True))
-    episode_uuids = set(Episode.objects.values_list("uuid", flat=True))
+    movie_uuids = set(_eligible_movie_queryset().values_list("uuid", flat=True))
+    allowed_series_ids = _eligible_series_queryset().values_list("id", flat=True)
+    episode_uuids = set(
+        Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
+    )
 
     def check_one(p: Path):
         try:
@@ -728,9 +787,9 @@ def _run_job_sync(
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     # Only generate .strm files for movies with active provider relations
-    qs = Movie.objects.filter(
-        m3u_relations__m3u_account__is_active=True
-    ).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    qs = _eligible_movie_queryset().only(
+        "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo"
+    )
     work = list(qs)
     LOGGER.info("Movies to process: %d", len(work))
 
@@ -839,9 +898,9 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
     # Only generate .strm files for series with active provider relations
     # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
-    series_qs = Series.objects.filter(
-        m3u_relations__m3u_account__is_active=True
-    ).annotate(episode_count=Count('episodes', distinct=True)).distinct().only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    series_qs = _eligible_series_queryset().annotate(
+        episode_count=Count('episodes', distinct=True)
+    ).only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
@@ -1042,9 +1101,10 @@ def _db_cleanup() -> str:
 
 
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
-    movies = Movie.objects.count()
-    series = Series.objects.count()
-    episodes = Episode.objects.count()
+    movies = _eligible_movie_queryset().count()
+    series_qs = _eligible_series_queryset()
+    series = series_qs.count()
+    episodes = Episode.objects.filter(series_id__in=series_qs.values_list("id", flat=True)).count()
 
     rows.append(["stats", "", "", "movies", "", "", "", "", "info", str(movies)])
     rows.append(["stats", "", "", "series", "", "", "", "", "info", str(series)])
