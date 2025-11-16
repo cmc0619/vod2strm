@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A high-performance Dispatcharr plugin that exports VOD libraries (Movies and Series/Episodes) into structured filesystems of `.strm` and `.nfo` files for Plex, Emby, Jellyfin, or Kodi. Runs entirely inside Dispatcharr using Django ORM for data access and Celery for background jobs (with thread fallback).
+A high-performance Dispatcharr plugin that exports VOD libraries (Movies and Series/Episodes) into structured filesystems of `.strm` and `.nfo` files for Plex, Emby, Jellyfin, or Kodi. Runs entirely inside Dispatcharr using Django ORM for data access and Celery for background jobs.
 
 **Key Features:**
 - Generate `.strm` proxy files pointing to Dispatcharr's VOD endpoints
@@ -21,7 +21,7 @@ A high-performance Dispatcharr plugin that exports VOD libraries (Movies and Ser
 - **Framework:** Django plugin for Dispatcharr
 - **Language:** Python 3.x
 - **ORM:** Django ORM for database access
-- **Task Queue:** Celery (with threading fallback)
+- **Task Queue:** Celery
 - **Database:** PostgreSQL (Dispatcharr's database)
 
 ### Key Libraries
@@ -153,6 +153,57 @@ class AdaptiveThrottle:
 
 **Critical Fix:** Cleanup runs BEFORE generation (not after) to prevent race condition where new files get deleted immediately after creation.
 
+### Scheduled Tasks with Celery Beat (`plugin.py:1230-1268`)
+
+**Implementation Pattern:**
+
+This plugin implements scheduled STRM generation using Celery Beat with programmatic task registration (not Django's PeriodicTask model).
+
+**How It Works:**
+
+1. **Task Definition**: Use `@shared_task` decorator to define the scheduled task function:
+```python
+@shared_task(name="vod2strm.plugin.generate_all")
+def celery_generate_all():
+    # Load settings from database
+    # Execute _run_job_sync with mode="all"
+```
+
+2. **Schedule Registration**: Configure Celery Beat schedule programmatically in `Plugin.ready()`:
+```python
+celery_app.conf.beat_schedule["vod2strm.periodic_generate_all"] = {
+    "task": "vod2strm.plugin.generate_all",
+    "schedule": {"type": "crontab", "hour": 3, "minute": 30},
+    "args": []
+}
+```
+
+3. **Settings Loading**: Scheduled tasks load their own settings from PluginConfig database:
+```python
+plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+settings = plugin_config.settings if plugin_config else {}
+```
+
+**Key Learnings from EPG Scheduler Plugin:**
+
+- Other scheduler plugins (like EPG refresh) use a different approach - they create Django `PeriodicTask` model instances to schedule **existing** Dispatcharr tasks
+- Our plugin defines **custom** tasks using `@shared_task`, giving us more control over execution
+- Scheduled tasks must be self-contained - they can't rely on user-provided parameters, so they load settings from the database
+- Always set `dry_run=False` for scheduled runs (user wouldn't schedule dry runs)
+
+**Schedule Format Support:**
+
+- **Simple**: `"daily 03:30"` - runs at 3:30 AM every day
+- **Crontab**: `"0 3 * * *"` - standard 5-field cron syntax
+- **Extended**: `"0 0 3 * * *"` - 6-field with seconds
+
+**Important Notes:**
+
+- Workers must be restarted after plugin installation for beat schedules to register
+- Schedule registration happens in `Plugin.ready()` which runs on Django startup
+- Task names must match exactly: `"vod2strm.plugin.generate_all"` → `celery_generate_all` function
+- Beat scheduler is a separate process from workers (`celery beat` vs `celery worker`)
+
 ## Workflow & Git Rules
 
 <!-- anchor: git-workflow -->
@@ -195,13 +246,13 @@ Added UI buttons for development/debugging:
 ### Celery Task Registration Fix (PR #21)
 **Location:** `plugin.py:51-55`, `plugin.py:1276-1306`
 
-**Problem:** Tasks were disabled with `if False`, causing warnings and forcing thread fallback.
+**Problem:** Tasks were disabled with `if False`, causing warnings.
 
 **Solution:**
 - Import `shared_task` from celery module
 - Use `@shared_task` decorator directly in plugin.py
 - Tasks auto-register when plugin module loads
-- Maintains thread fallback if Celery unavailable
+- Celery is required (Dispatcharr depends on it)
 
 ### NAS Overload Protection (PR #21)
 **Location:** `plugin.py:162-183`
@@ -308,7 +359,7 @@ These areas should NOT be modified by AI without explicit user approval:
 ### Threading/Concurrency
 - ❌ **NEVER** start ThreadPoolExecutor with >4 workers (exhausts Django DB connections)
 - ❌ **NEVER** modify shared state without locks (manifest, report_rows)
-- ❌ **NEVER** block the main Django thread (use Celery or threading)
+- ❌ **NEVER** block the main Django thread (use Celery for background tasks)
 
 ### Git/Deployment
 - ❌ **NEVER** merge to main without explicit user approval
@@ -361,24 +412,22 @@ python3 -m py_compile plugin.py
 ```mermaid
 graph TD
     A[User clicks action button] --> B[Plugin.run]
-    B --> C{Celery available?}
-    C -->|Yes| D[celery_run_job task]
-    C -->|No| E[Thread fallback]
-    D --> F[_run_job_sync]
-    E --> F
-    F --> G[Load manifest]
-    F --> H[Query Django ORM]
-    G --> I[ThreadPoolExecutor]
-    H --> I
-    I --> J[_make_movie_strm_and_nfo]
-    I --> K[_make_episode_strm_and_nfo]
-    J --> L[AdaptiveThrottle.record_write]
-    K --> L
-    L --> M{Adjust workers?}
-    M -->|Every 10 writes| N[Check avg latency]
-    N --> O[Scale up/down workers]
-    F --> P[Save manifest]
-    F --> Q[Generate CSV report]
+    B --> C[celery_run_job.delay]
+    C --> D[Celery worker]
+    D --> E[_run_job_sync]
+    E --> F[Load manifest]
+    E --> G[Query Django ORM]
+    F --> H[ThreadPoolExecutor]
+    G --> H
+    H --> I[_make_movie_strm_and_nfo]
+    H --> J[_make_episode_strm_and_nfo]
+    I --> K[AdaptiveThrottle.record_write]
+    J --> K
+    K --> L{Adjust workers?}
+    L -->|Every 10 writes| M[Check avg latency]
+    M --> N[Scale up/down workers]
+    E --> O[Save manifest]
+    E --> P[Generate CSV report]
 ```
 
 ## Maintenance Notes
