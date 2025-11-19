@@ -847,9 +847,14 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
-    Refresh episodes from providers in user-configured priority order.
-    Tries each provider until one successfully returns episodes.
-    Calls refresh_series_episodes() directly (synchronous, matching Dispatcharr UI pattern).
+    Refresh episodes from the highest priority provider only.
+
+    Since Dispatcharr deduplicates series by TMDB/IMDB ID, all provider relations
+    for a series point to the same series_id. Therefore we only need to call
+    refresh_series_episodes once - from the highest priority provider.
+
+    This avoids redundant refresh calls and potential race conditions when
+    multiple providers try to populate the same episode rows.
 
     Returns True if episodes were successfully fetched.
     """
@@ -863,80 +868,61 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
             return False
 
     try:
-        # Get all active relations, sorted by user-configured priority
-        relations = series.m3u_relations.select_related('m3u_account').filter(
+        # Get highest priority active relation only
+        relation = series.m3u_relations.select_related('m3u_account').filter(
             m3u_account__is_active=True
-        ).order_by('-m3u_account__priority', 'id')
+        ).order_by('-m3u_account__priority', 'id').first()
 
-        if not relations:
+        if not relation:
             LOGGER.debug("Series id=%s has no active M3U account relations", series.id)
             return False
 
-        # Workaround for Dispatcharr issue #569: Multiple M3UEpisodeRelation records
-        relation_count = relations.count()
-        if relation_count > 1:
-            LOGGER.warning(
-                "Series id=%s has %d M3U relations (Dispatcharr issue #569). Using highest priority provider only.",
-                series.id,
-                relation_count
-            )
+        LOGGER.info(
+            "Refreshing episodes for series_id=%s from provider %s (priority %s)",
+            series.id,
+            relation.m3u_account.name,
+            relation.m3u_account.priority
+        )
 
-        # Try each provider in priority order
-        for relation in relations:
+        try:
+            # Call refresh directly (synchronous, matching UI pattern)
+            refresh_series_episodes(
+                relation.m3u_account,
+                series,
+                relation.external_series_id
+            )
+        except Exception as refresh_error:
+            # Check if this is the duplicate key constraint error from issue #556
+            error_str = str(refresh_error)
+            if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
+                LOGGER.warning(
+                    "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
+                    "This is a Dispatcharr bug - episodes may have disappeared.",
+                    series.id
+                )
+            else:
+                LOGGER.warning(
+                    "Episode refresh error for series_id=%s from provider %s: %s",
+                    series.id,
+                    relation.m3u_account.name,
+                    refresh_error
+                )
+            return False
+
+        # Check if we got episodes
+        episode_count = Episode.objects.filter(series_id=series.id).count()
+        if episode_count > 0:
             LOGGER.info(
-                "Attempting episode refresh for series_id=%s from provider %s (priority %s)",
-                series.id,
-                relation.m3u_account.name,
-                relation.m3u_account.priority
-            )
-
-            try:
-                # Call refresh directly (synchronous, matching UI pattern)
-                # Workaround for Dispatcharr issue #556: Catch duplicate key errors during refresh
-                refresh_series_episodes(
-                    relation.m3u_account,
-                    series,
-                    relation.external_series_id
-                )
-            except Exception as refresh_error:
-                # Check if this is the duplicate key constraint error from issue #556
-                error_str = str(refresh_error)
-                if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
-                    LOGGER.warning(
-                        "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
-                        "Episodes may have disappeared during sync. Skipping this provider.",
-                        series.id
-                    )
-                    continue
-                else:
-                    # Different error - log and try next provider
-                    LOGGER.warning(
-                        "Episode refresh error for series_id=%s from provider %s: %s",
-                        series.id,
-                        relation.m3u_account.name,
-                        refresh_error
-                    )
-                    continue
-
-            # Check if we got episodes
-            episode_count = Episode.objects.filter(series_id=series.id).count()
-            if episode_count > 0:
-                LOGGER.info(
-                    "Successfully fetched %d episodes from provider %s",
-                    episode_count,
-                    relation.m3u_account.name
-                )
-                return True
-
-            LOGGER.warning(
-                "Provider %s did not return episodes, trying next provider",
+                "Successfully fetched %d episodes from provider %s",
+                episode_count,
                 relation.m3u_account.name
             )
+            return True
 
-        LOGGER.warning(
-            "No provider returned episodes for series_id=%s after trying %d provider(s)",
-            series.id,
-            relations.count()
+        LOGGER.debug(
+            "Provider %s returned 0 episodes for series_id=%s",
+            relation.m3u_account.name,
+            series.id
         )
         return False
 
