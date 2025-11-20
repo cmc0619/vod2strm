@@ -845,6 +845,67 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
         LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
 
 
+def _cleanup_series_episodes(series_id: int) -> bool:
+    """
+    Targeted cleanup for a single series - deletes episodes and resets cache flags.
+
+    This is called when Dispatcharr issue #556 duplicate key error occurs during
+    series refresh. Instead of leaving corrupted data, we clean the series and
+    allow a retry.
+
+    Args:
+        series_id: The series ID to clean up
+
+    Returns:
+        True if cleanup succeeded, False otherwise
+    """
+    try:
+        with transaction.atomic():
+            # Count what will be deleted
+            episode_count = Episode.objects.filter(series_id=series_id).count()
+
+            if episode_count > 0:
+                # Delete episodes for this series (cascade handles M3UEpisodeRelation)
+                deleted_count, details = Episode.objects.filter(series_id=series_id).delete()
+                LOGGER.info(
+                    "Cleaned up series_id=%s: deleted %d objects (%d episodes)",
+                    series_id,
+                    deleted_count,
+                    episode_count
+                )
+
+            # Reset cache flags for this series' relations
+            relation_count = M3USeriesRelation.objects.filter(series_id=series_id).count()
+            if relation_count > 0:
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE vod_m3useriesrelation
+                        SET custom_properties = jsonb_set(
+                                jsonb_set(
+                                    COALESCE(custom_properties, '{}'::jsonb),
+                                    '{episodes_fetched}', 'false'::jsonb,
+                                    true
+                                ),
+                                '{detailed_fetched}', 'false'::jsonb,
+                                true
+                            ),
+                            last_episode_refresh = NULL
+                        WHERE series_id = %s
+                    """, [series_id])
+                    reset_count = cursor.rowcount
+                    LOGGER.info(
+                        "Reset %d cache flags for series_id=%s",
+                        reset_count,
+                        series_id
+                    )
+
+        return True
+
+    except Exception as e:
+        LOGGER.exception("Failed to clean up series_id=%s: %s", series_id, e)
+        return False
+
+
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
     Refresh episodes from the highest priority provider only.
@@ -897,9 +958,30 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
             if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
                 LOGGER.warning(
                     "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
-                    "This is a Dispatcharr bug - episodes may have disappeared.",
+                    "Attempting targeted cleanup and retry...",
                     series.id
                 )
+                # Clean up corrupted episodes and cache flags for this series
+                if _cleanup_series_episodes(series.id):
+                    LOGGER.info("Cleanup succeeded, retrying refresh for series_id=%s", series.id)
+                    try:
+                        # Retry the refresh once after cleanup
+                        refresh_series_episodes(
+                            relation.m3u_account,
+                            series,
+                            relation.external_series_id
+                        )
+                        LOGGER.info("Retry succeeded for series_id=%s after cleanup", series.id)
+                    except Exception as retry_error:
+                        LOGGER.error(
+                            "Retry failed for series_id=%s after cleanup: %s",
+                            series.id,
+                            retry_error
+                        )
+                        return False
+                else:
+                    LOGGER.error("Cleanup failed for series_id=%s, giving up", series.id)
+                    return False
             else:
                 LOGGER.warning(
                     "Episode refresh error for series_id=%s from provider %s: %s",
@@ -907,7 +989,7 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
                     relation.m3u_account.name,
                     refresh_error
                 )
-            return False
+                return False
 
         # Check if we got episodes
         episode_count = Episode.objects.filter(series_id=series.id).count()
