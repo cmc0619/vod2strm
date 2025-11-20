@@ -13,7 +13,7 @@ A high-performance Dispatcharr plugin that exports VOD libraries (Movies and Ser
 - Scheduled runs via Celery beat
 - Auto-run after VOD refresh with debouncing
 
-**Current Version:** `0.0.4`
+**Current Version:** `0.0.5`
 
 ## Technology Stack
 

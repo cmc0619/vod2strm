@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.4
+Version: 0.0.5
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -1290,7 +1290,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.4"
+    version = "0.0.5"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1672,7 +1672,7 @@ try:
     from django.db.models.signals import post_save, post_delete
     from django.dispatch import receiver
 
-    # Listen for Episode creation/updates (bulk_created signal doesn't fire for all cases)
+    # Listen for Episode creation (bulk_created signal doesn't fire for all cases)
     @receiver(post_save, sender=Episode)
     def on_episode_saved(sender, instance, created, **kwargs):
         """
