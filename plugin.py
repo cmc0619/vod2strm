@@ -1490,6 +1490,7 @@ else:
 # Debounce state for auto-run
 _auto_run_debounce_timer = None
 _auto_run_lock = threading.Lock()
+_auto_run_in_progress = False  # Prevents infinite loop when our own runs create episodes
 
 
 def _schedule_auto_run_after_vod_refresh():
@@ -1517,18 +1518,24 @@ def _schedule_auto_run_after_vod_refresh():
 
             # Schedule new run in 30 seconds
             def run_generation():
+                global _auto_run_in_progress
                 LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
-                _run_job_sync(
-                    mode="all",
-                    output_root=settings.get("output_root") or DEFAULT_ROOT,
-                    base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-                    write_nfos=bool(settings.get("write_nfos", True)),
-                    cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-                    concurrency=int(settings.get("concurrency") or 4),
-                    debug_logging=bool(settings.get("debug_logging", False)),
-                    dry_run=False,
-                    adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-                )
+                _auto_run_in_progress = True
+                try:
+                    _run_job_sync(
+                        mode="all",
+                        output_root=settings.get("output_root") or DEFAULT_ROOT,
+                        base_url=settings.get("base_url") or DEFAULT_BASE_URL,
+                        write_nfos=bool(settings.get("write_nfos", True)),
+                        cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
+                        concurrency=int(settings.get("concurrency") or 4),
+                        debug_logging=bool(settings.get("debug_logging", False)),
+                        dry_run=False,
+                        adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                    )
+                finally:
+                    _auto_run_in_progress = False
+                    LOGGER.debug("Auto-run completed, flag cleared")
 
             _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
             _auto_run_debounce_timer.daemon = True
@@ -1548,13 +1555,16 @@ try:
     @receiver(post_save, sender=Episode)
     def on_episode_saved(sender, instance, created, **kwargs):
         """Trigger auto-run when episodes are created/updated"""
-        if created:  # Only on new episodes
+        # Don't trigger if we're already running (prevents infinite loop when our own
+        # _maybe_internal_refresh_series creates episodes)
+        if created and not _auto_run_in_progress:
             _schedule_auto_run_after_vod_refresh()
 
     @receiver(post_save, sender=Movie)
     def on_movie_saved(sender, instance, created, **kwargs):
         """Trigger auto-run when movies are created/updated"""
-        if created:  # Only on new movies
+        # Don't trigger if we're already running
+        if created and not _auto_run_in_progress:
             _schedule_auto_run_after_vod_refresh()
 
     LOGGER.info("VOD refresh signal handlers registered")
