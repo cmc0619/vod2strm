@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any
 
 from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
-from django.db import transaction  # noqa:F401
+from django.db import connection, transaction  # noqa:F401
 from django.db.models import Count, Exists, OuterRef, Q
 from django.utils.timezone import now  # noqa:F401
 
@@ -1116,12 +1116,14 @@ def _db_stats() -> str:
 
 def _db_cleanup() -> str:
     """
-    Database cleanup - deletes ALL episodes and episode relations.
+    Database cleanup - deletes ALL episodes and episode relations, then resets series cache flags.
     Issue #556 - Quick database cleanup for development/debugging.
 
-    Replicates these SQL commands in Django ORM:
-        DELETE FROM vod_episode;
-        DELETE FROM vod_m3uepisoderelation;
+    Replicates these operations:
+        1. DELETE FROM vod_episode (cascades to vod_m3uepisoderelation)
+        2. RESET series cache flags (episodes_fetched, detailed_fetched, last_episode_refresh)
+
+        This ensures Dispatcharr will re-fetch episodes on next UI interaction.
 
     Returns:
         Formatted string with operation results
@@ -1130,21 +1132,46 @@ def _db_cleanup() -> str:
     results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
 
     try:
-        # Count what will be deleted
+        # Count what will be deleted/reset
         episode_count = Episode.objects.count()
+        series_relation_count = M3USeriesRelation.objects.count()
 
         results.append(f"Episodes to delete: {episode_count}")
+        results.append(f"Series relations to reset: {series_relation_count}")
 
-        if episode_count > 0:
+        if episode_count > 0 or series_relation_count > 0:
             with transaction.atomic():
                 # Delete all episodes (cascade deletes will handle M3UEpisodeRelation automatically)
-                deleted_count, details = Episode.objects.all().delete()
-                results.append(f"\n✓ Deleted {deleted_count} objects:")
-                for model, count in details.items():
-                    if count > 0:
-                        results.append(f"  - {model}: {count}")
+                if episode_count > 0:
+                    deleted_count, details = Episode.objects.all().delete()
+                    results.append(f"\n✓ Deleted {deleted_count} objects:")
+                    for model, count in details.items():
+                        if count > 0:
+                            results.append(f"  - {model}: {count}")
+
+                # Reset series cache flags so Dispatcharr re-fetches episodes on next UI interaction
+                if series_relation_count > 0:
+                    with connection.cursor() as cursor:
+                        cursor.execute("""
+                            UPDATE vod_m3useriesrelation
+                            SET custom_properties = jsonb_set(
+                                    jsonb_set(
+                                        COALESCE(custom_properties, '{}'::jsonb),
+                                        '{episodes_fetched}', 'false'::jsonb,
+                                        true
+                                    ),
+                                    '{detailed_fetched}', 'false'::jsonb,
+                                    true
+                                ),
+                                last_episode_refresh = NULL
+                        """)
+                        reset_count = cursor.rowcount
+                    results.append(f"\n✓ Reset {reset_count} series relation cache flags")
         else:
-            results.append("\nNothing to delete.")
+            results.append("\nNothing to delete or reset.")
+
+        results.append("\n✓ Cleanup complete. Dispatcharr will re-fetch episodes on next series view.")
+        LOGGER.info("Database cleanup completed successfully")
 
     except Exception as e:
         LOGGER.exception("Database cleanup failed")
