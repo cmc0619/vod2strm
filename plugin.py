@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any
 
 from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
-from django.db import transaction  # noqa:F401
+from django.db import connection, transaction  # noqa:F401
 from django.db.models import Count, Exists, OuterRef, Q
 from django.utils.timezone import now  # noqa:F401
 
@@ -866,7 +866,7 @@ def _cleanup_series_episodes(series_id: int) -> bool:
 
             if episode_count > 0:
                 # Delete episodes for this series (cascade handles M3UEpisodeRelation)
-                deleted_count, details = Episode.objects.filter(series_id=series_id).delete()
+                deleted_count, _ = Episode.objects.filter(series_id=series_id).delete()
                 LOGGER.info(
                     "Cleaned up series_id=%s: deleted %d objects (%d episodes)",
                     series_id,
@@ -875,6 +875,11 @@ def _cleanup_series_episodes(series_id: int) -> bool:
                 )
 
             # Reset cache flags for this series' relations
+            # NOTE: Using raw SQL instead of ORM because:
+            # 1. custom_properties is PostgreSQL JSONB - need to update nested keys without replacing entire object
+            # 2. ORM would require N queries (fetch, modify, save for each relation) = slow + not atomic
+            # 3. PostgreSQL's jsonb_set() does atomic partial updates in a single query
+            # 4. Django ORM lacks native JSONB merge/partial update support
             relation_count = M3USeriesRelation.objects.filter(series_id=series_id).count()
             if relation_count > 0:
                 with connection.cursor() as cursor:
@@ -901,8 +906,8 @@ def _cleanup_series_episodes(series_id: int) -> bool:
 
         return True
 
-    except Exception as e:
-        LOGGER.exception("Failed to clean up series_id=%s: %s", series_id, e)
+    except Exception:
+        LOGGER.exception("Failed to clean up series_id=%s", series_id)
         return False
 
 
