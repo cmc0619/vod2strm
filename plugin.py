@@ -1518,6 +1518,13 @@ def _schedule_auto_run_after_vod_refresh():
 
             # Schedule new run in 30 seconds
             def run_generation():
+                """
+                Execute debounced STRM generation job.
+
+                Sets _auto_run_in_progress flag to prevent signal handlers from
+                triggering another auto-run while this one is executing. Flag is
+                cleared in finally block to ensure it's reset even on errors.
+                """
                 global _auto_run_in_progress
                 LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
                 _auto_run_in_progress = True
@@ -1554,7 +1561,19 @@ try:
     # Listen for Episode creation/updates (bulk_created signal doesn't fire for all cases)
     @receiver(post_save, sender=Episode)
     def on_episode_saved(sender, instance, created, **kwargs):
-        """Trigger auto-run when episodes are created/updated"""
+        """
+        Django signal handler triggered when Episode model is saved.
+
+        Schedules auto-run generation only when NEW episodes are created (not updates).
+        Checks _auto_run_in_progress flag to prevent infinite loops when our own
+        _maybe_internal_refresh_series() creates episodes during generation.
+
+        Args:
+            sender: The model class (Episode)
+            instance: The actual Episode instance being saved
+            created: Boolean indicating if this is a new row (True) or update (False)
+            **kwargs: Additional signal arguments
+        """
         # Don't trigger if we're already running (prevents infinite loop when our own
         # _maybe_internal_refresh_series creates episodes)
         if created and not _auto_run_in_progress:
@@ -1562,7 +1581,18 @@ try:
 
     @receiver(post_save, sender=Movie)
     def on_movie_saved(sender, instance, created, **kwargs):
-        """Trigger auto-run when movies are created/updated"""
+        """
+        Django signal handler triggered when Movie model is saved.
+
+        Schedules auto-run generation only when NEW movies are created (not updates).
+        Checks _auto_run_in_progress flag to prevent re-triggering during active runs.
+
+        Args:
+            sender: The model class (Movie)
+            instance: The actual Movie instance being saved
+            created: Boolean indicating if this is a new row (True) or update (False)
+            **kwargs: Additional signal arguments
+        """
         # Don't trigger if we're already running
         if created and not _auto_run_in_progress:
             _schedule_auto_run_after_vod_refresh()
