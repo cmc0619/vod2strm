@@ -1491,7 +1491,6 @@ else:
 _auto_run_debounce_timer = None
 _auto_run_lock = threading.Lock()
 _auto_run_in_progress = False  # Prevents infinite loop when our own runs create episodes
-_auto_run_needs_rerun = False  # Set when new content arrives during active run
 
 
 def _schedule_auto_run_after_vod_refresh():
@@ -1523,11 +1522,10 @@ def _schedule_auto_run_after_vod_refresh():
                 Execute debounced STRM generation job.
 
                 Sets _auto_run_in_progress flag to prevent signal handlers from
-                triggering another auto-run while this one is executing. If new
-                content arrives during execution, _auto_run_needs_rerun is set,
-                and we schedule another run after completion.
+                triggering another auto-run while this one is executing. Flag is
+                cleared in finally block to ensure it's reset even on errors.
                 """
-                global _auto_run_in_progress, _auto_run_needs_rerun
+                global _auto_run_in_progress
                 LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
                 _auto_run_in_progress = True
                 try:
@@ -1544,13 +1542,7 @@ def _schedule_auto_run_after_vod_refresh():
                     )
                 finally:
                     _auto_run_in_progress = False
-                    # Check if new content arrived during run
-                    if _auto_run_needs_rerun:
-                        LOGGER.info("New content detected during run, scheduling follow-up")
-                        _auto_run_needs_rerun = False
-                        _schedule_auto_run_after_vod_refresh()
-                    else:
-                        LOGGER.debug("Auto-run completed, no follow-up needed")
+                    LOGGER.debug("Auto-run completed, flag cleared")
 
             _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
             _auto_run_debounce_timer.daemon = True
@@ -1573,9 +1565,8 @@ try:
         Django signal handler triggered when Episode model is saved.
 
         Schedules auto-run generation only when NEW episodes are created (not updates).
-        If a run is already in progress, sets _auto_run_needs_rerun flag so a follow-up
-        run will be scheduled after the current one completes. This prevents infinite
-        loops while ensuring no new content is missed.
+        Checks _auto_run_in_progress flag to prevent infinite loops when our own
+        _maybe_internal_refresh_series() creates episodes during generation.
 
         Args:
             sender: The model class (Episode)
@@ -1583,15 +1574,10 @@ try:
             created: Boolean indicating if this is a new row (True) or update (False)
             **kwargs: Additional signal arguments
         """
-        global _auto_run_needs_rerun
-        if created:
-            if _auto_run_in_progress:
-                # Run in progress - flag for follow-up instead of scheduling now
-                _auto_run_needs_rerun = True
-                LOGGER.debug("Episode created during auto-run, flagged for follow-up")
-            else:
-                # No run in progress - schedule normally
-                _schedule_auto_run_after_vod_refresh()
+        # Don't trigger if we're already running (prevents infinite loop when our own
+        # _maybe_internal_refresh_series creates episodes)
+        if created and not _auto_run_in_progress:
+            _schedule_auto_run_after_vod_refresh()
 
     @receiver(post_save, sender=Movie)
     def on_movie_saved(sender, instance, created, **kwargs):
@@ -1599,9 +1585,7 @@ try:
         Django signal handler triggered when Movie model is saved.
 
         Schedules auto-run generation only when NEW movies are created (not updates).
-        If a run is already in progress, sets _auto_run_needs_rerun flag so a follow-up
-        run will be scheduled after the current one completes. This prevents infinite
-        loops while ensuring no new content is missed.
+        Checks _auto_run_in_progress flag to prevent re-triggering during active runs.
 
         Args:
             sender: The model class (Movie)
@@ -1609,15 +1593,9 @@ try:
             created: Boolean indicating if this is a new row (True) or update (False)
             **kwargs: Additional signal arguments
         """
-        global _auto_run_needs_rerun
-        if created:
-            if _auto_run_in_progress:
-                # Run in progress - flag for follow-up instead of scheduling now
-                _auto_run_needs_rerun = True
-                LOGGER.debug("Movie created during auto-run, flagged for follow-up")
-            else:
-                # No run in progress - schedule normally
-                _schedule_auto_run_after_vod_refresh()
+        # Don't trigger if we're already running
+        if created and not _auto_run_in_progress:
+            _schedule_auto_run_after_vod_refresh()
 
     LOGGER.info("VOD refresh signal handlers registered")
 
