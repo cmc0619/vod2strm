@@ -740,10 +740,13 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
                 # Check if season.nfo exists in empty season folder and delete it
                 if d.exists():
                     season_nfo = d / "season.nfo"
-                    if season_nfo.exists() and not any(f for f in d.iterdir() if f.suffix == '.strm'):
-                        # No .strm files left in season folder, delete season.nfo
-                        season_nfo.unlink()
-                        pruned_season_nfos += 1
+                    if season_nfo.exists():
+                        # Check if there are any OTHER files besides season.nfo (and maybe .DS_Store etc)
+                        # If no .strm files remain, we should delete season.nfo
+                        has_strm = any(f.suffix == '.strm' for f in d.iterdir())
+                        if not has_strm:
+                            season_nfo.unlink()
+                            pruned_season_nfos += 1
 
                 # Delete empty directories
                 cur = d
