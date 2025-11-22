@@ -1431,7 +1431,7 @@ class Plugin:
         concurrency = int(settings.get("concurrency") or 4)
         dry_run = bool(settings.get("dry_run", False))
         adaptive_throttle = bool(settings.get("adaptive_throttle", True))
-        clean_regex = settings.get("name_clean_regex", "").strip() or None
+        clean_regex = (settings.get("name_clean_regex") or "").strip() or None
 
         LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s",
                     action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
@@ -1606,7 +1606,7 @@ if shared_task is not None:
                 adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
                 debug_logging=bool(settings.get("debug_logging", False)),
                 dry_run=False,  # Scheduled runs always run for real
-                clean_regex=settings.get("name_clean_regex", "").strip() or None,
+                clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
             )
             LOGGER.info("Celery scheduled task generate_all completed successfully")
         except Exception as e:
@@ -1684,7 +1684,7 @@ def _schedule_auto_run_after_vod_refresh():
                         debug_logging=bool(settings.get("debug_logging", False)),
                         dry_run=False,
                         adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-                        clean_regex=settings.get("name_clean_regex", "").strip() or None,
+                        clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
                     )
                 finally:
                     _auto_run_in_progress = False
