@@ -1,0 +1,37 @@
+name: Build tagged release zip
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-zip:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed for uploading the release asset
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Determine zip filename
+        id: vars
+        run: |
+          TAG="${GITHUB_REF##*/}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "zipname=vod2strm-${TAG}.zip" >> $GITHUB_OUTPUT
+
+      - name: Create tagged zip with constant folder name
+        run: |
+          git archive \
+            --format=zip \
+            --prefix=vod2strm/ \
+            "$GITHUB_SHA" \
+            -o "${{ steps.vars.outputs.zipname }}"
+
+      - name: Upload ZIP to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.vars.outputs.zipname }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
