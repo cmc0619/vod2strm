@@ -310,6 +310,22 @@ def _norm_fs_name(s: str) -> str:
     return s or "Unknown"
 
 
+def _clean_name(name: str, pattern: str | None) -> str:
+    """
+    Clean a name using the provided regex pattern.
+    Used to strip prefixes like "EN - " or "TOP - " from names.
+    """
+    if not name or not pattern:
+        return name
+    try:
+        # Strip the pattern from the name
+        # We use sub() to replace matches with empty string
+        return re.sub(pattern, "", name).strip()
+    except re.error as e:
+        LOGGER.warning("Invalid name cleaning regex '%s': %s", pattern, e)
+        return name
+
+
 def _season_folder_name(season_number: int) -> str:
     if season_number == 0:
         return "Season 00 (Specials)"
@@ -427,10 +443,12 @@ def _xml_escape(text: str | None) -> str:
 
 # -------------------- NFO Builders --------------------
 
-def _nfo_movie(m: Movie) -> bytes:
+def _nfo_movie(m: Movie, clean_name: str | None = None) -> bytes:
     # Use name field - title field doesn't exist in Movie model
+    # Use clean_name if provided (for title tag), otherwise fall back to DB name
+    title = clean_name if clean_name else (m.name or "")
     fields = {
-        "title": m.name or "",
+        "title": title,
         "plot": getattr(m, "description", "") or "",
         "year": str(getattr(m, "year", "") or ""),
         "rating": str(getattr(m, "rating", "") or ""),
@@ -454,11 +472,11 @@ def _nfo_movie(m: Movie) -> bytes:
     return xml.getvalue().encode("utf-8")
 
 
-def _nfo_season(s: Series, season_number: int) -> bytes:
+def _nfo_season(s: Series, season_number: int, clean_series_name: str | None = None) -> bytes:
     xml = io.StringIO()
     xml.write("<season>\n")
     xml.write(f"  <seasonnumber>{season_number}</seasonnumber>\n")
-    name = s.name or ""
+    name = clean_series_name if clean_series_name else (s.name or "")
     year = getattr(s, "year", None)
     xml.write(f"  <tvshowtitle>{_xml_escape(_series_folder_name(name, year))}</tvshowtitle>\n")
     xml.write("</season>\n")
@@ -527,9 +545,11 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None) -> None:
     # Use name field - title field doesn't exist in Movie model
-    movie_name = movie.name or ""
+    raw_name = movie.name or ""
+    movie_name = _clean_name(raw_name, clean_regex)
+
     m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
@@ -541,20 +561,20 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         throttle.record_write(time.time() - start_time)
 
     with lock:
-        report_rows.append(["movie", "", "", movie_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
+        report_rows.append(["movie", "", "", raw_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
         nfo_start = time.time()
         nfo_path = m_folder / "movie.nfo"
-        nfo_bytes = _nfo_movie(movie)
+        nfo_bytes = _nfo_movie(movie, clean_name=movie_name)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
         if wrote_nfo and throttle:
             throttle.record_write(time.time() - nfo_start)
         with lock:
-            report_rows.append(["movie_nfo", "", "", movie.name or "", getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
+            report_rows.append(["movie_nfo", "", "", raw_name, getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, clean_regex: str | None = None) -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -575,7 +595,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     except Exception as validation_error:
         LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
 
-    s_folder = root / "TV" / _series_folder_name(series.name or "", getattr(series, "year", None))
+    s_folder = root / "TV" / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
@@ -609,7 +629,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         if should_write_season:
             season_start = time.time()
             season_nfo_path = e_folder / "season.nfo"
-            season_nfo_bytes = _nfo_season(series, season_number)
+            season_nfo_bytes = _nfo_season(series, season_number, clean_series_name=_clean_name(series.name or "", clean_regex))
             wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
             if wrote_s and throttle:
                 throttle.record_write(time.time() - season_start)
@@ -764,10 +784,11 @@ def _run_job_sync(
     debug_logging: bool = False,
     dry_run: bool = False,
     adaptive_throttle: bool = True,
+    clean_regex: str | None = None,
 ) -> None:
     _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s",
+                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
 
     root = Path(output_root)
     ts = _ts()
@@ -789,10 +810,10 @@ def _run_job_sync(
                     LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
         if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
+            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex)
 
         if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle)
+            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex)
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
@@ -805,8 +826,8 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
-    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
+def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None) -> None:
+    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s)", dry_run, adaptive_throttle, clean_regex)
     # Only generate .strm files for movies with active provider relations
     qs = _eligible_movie_queryset().only(
         "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo"
@@ -827,7 +848,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
         def job(m: Movie) -> None:
             try:
-                _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle)
+                _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, clean_regex)
             except Exception as e:
                 LOGGER.warning("Movie id=%s failed: %s", m.id, e)
                 with lock:
@@ -1018,8 +1039,8 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
         return False
 
 
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True) -> None:
-    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s)", dry_run, adaptive_throttle)
+def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None) -> None:
+    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s)", dry_run, adaptive_throttle, clean_regex)
     # Only generate .strm files for series with active provider relations
     # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
     series_qs = _eligible_series_queryset().annotate(
@@ -1039,7 +1060,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
     for s in series_qs.iterator(chunk_size=200):
         try:
-            series_folder = root / "TV" / _series_folder_name(s.name or "", getattr(s, "year", None))
+            series_folder = root / "TV" / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None))
             # Use annotated episode_count to avoid N+1 query
             expected = getattr(s, 'episode_count', 0)
 
@@ -1094,7 +1115,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 current_workers = throttle.get_workers()
 
                 def job(e: Episode) -> None:
-                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, written_seasons)
+                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, written_seasons, clean_regex)
 
                 with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
                     list(ex.map(job, batch))
@@ -1368,6 +1389,13 @@ class Plugin:
             "default": "",
             "help": "Leave blank to disable. Example: 'daily 03:30' or '0 30 3 * * *'",
         },
+        {
+            "id": "name_clean_regex",
+            "label": "Name Cleaning Regex",
+            "type": "string",
+            "default": "",
+            "help": "Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\s*-\s*). Matches are replaced with empty string.",
+        },
     ]
 
     actions = [
@@ -1403,9 +1431,10 @@ class Plugin:
         concurrency = int(settings.get("concurrency") or 4)
         dry_run = bool(settings.get("dry_run", False))
         adaptive_throttle = bool(settings.get("adaptive_throttle", True))
+        clean_regex = settings.get("name_clean_regex", "").strip() or None
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s",
+                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
 
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
@@ -1429,18 +1458,18 @@ class Plugin:
                 return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
             return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
             msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
             msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle)
+            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
             msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
             return {"status": "ok", "message": msg}
 
@@ -1494,7 +1523,7 @@ class Plugin:
         except Exception as e:  # pragma: no cover
             LOGGER.warning("Failed to register schedule: %s", e)
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None):
         args = {
             "mode": mode,
             "output_root": str(output_root),
@@ -1505,6 +1534,7 @@ class Plugin:
             "debug_logging": LOGGER.level <= logging.DEBUG,
             "dry_run": dry_run,
             "adaptive_throttle": adaptive_throttle,
+            "clean_regex": clean_regex,
         }
 
         # REASONING: Threading fallback removed
@@ -1520,7 +1550,7 @@ class Plugin:
 
         # Call the task using delay() - standard Celery pattern
         celery_run_job.delay(args)
-        LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s)", mode, dry_run, adaptive_throttle)
+        LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s)", mode, dry_run, adaptive_throttle, clean_regex)
 
 
 # -------------------- Celery task registration --------------------
@@ -1576,6 +1606,7 @@ if shared_task is not None:
                 adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
                 debug_logging=bool(settings.get("debug_logging", False)),
                 dry_run=False,  # Scheduled runs always run for real
+                clean_regex=settings.get("name_clean_regex", "").strip() or None,
             )
             LOGGER.info("Celery scheduled task generate_all completed successfully")
         except Exception as e:
@@ -1653,6 +1684,7 @@ def _schedule_auto_run_after_vod_refresh():
                         debug_logging=bool(settings.get("debug_logging", False)),
                         dry_run=False,
                         adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
+                        clean_regex=settings.get("name_clean_regex", "").strip() or None,
                     )
                 finally:
                     _auto_run_in_progress = False
