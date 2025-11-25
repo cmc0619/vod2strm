@@ -176,14 +176,18 @@ def _get_movie_stream_id(movie: Movie) -> str | None:
 def _get_episode_stream_id(episode: Episode) -> str | None:
     """
     Get stream_id from the highest priority active M3U provider for an episode.
+    Filters by enabled categories to respect user's category preferences.
 
     Returns stream_id or None if no active provider found.
     """
     try:
-        # Get highest priority active relation
+        # Get highest priority active relation, filtering by enabled categories
+        # Same logic as _get_movie_stream_id to ensure consistency
         relation = M3UEpisodeRelation.objects.filter(
             episode_id=episode.id,
             m3u_account__is_active=True,
+        ).filter(
+            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
         ).select_related('m3u_account').order_by(
             '-m3u_account__priority', 'id'
         ).first()
