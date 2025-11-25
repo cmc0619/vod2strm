@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.6
+Version: 0.0.7
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -9,7 +9,7 @@ Spec:
   * Movies -> <root>/Movies/{Name} ({Year})/{Name} ({Year}).strm
   * Series -> <root>/TV/{SeriesName (Year) or SeriesName + (year)}/Season {SS or 00}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
-  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}
+  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
 - NFO generation (compare-before-write):
   * Movies: movie.nfo in movie folder
   * Seasons: season.nfo per season folder
@@ -56,6 +56,7 @@ try:
         Series,
         Episode,
         M3UMovieRelation,
+        M3UEpisodeRelation,
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
@@ -65,6 +66,7 @@ except Exception:  # pragma: no cover
         Series,
         Episode,
         M3UMovieRelation,
+        M3UEpisodeRelation,
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
@@ -144,6 +146,54 @@ def _eligible_series_queryset():
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
     )
     return Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
+
+
+def _get_movie_stream_id(movie: Movie) -> str | None:
+    """
+    Get stream_id from the highest priority active M3U provider for a movie.
+
+    Returns stream_id or None if no active provider found.
+    """
+    try:
+        # Get highest priority active relation
+        relation = M3UMovieRelation.objects.filter(
+            movie_id=movie.id,
+            m3u_account__is_active=True,
+        ).filter(
+            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+        ).select_related('m3u_account').order_by(
+            '-m3u_account__priority', 'id'
+        ).first()
+
+        if relation:
+            return getattr(relation, 'stream_id', None)
+        return None
+    except Exception as e:
+        LOGGER.debug("Failed to get stream_id for movie id=%s: %s", movie.id, e)
+        return None
+
+
+def _get_episode_stream_id(episode: Episode) -> str | None:
+    """
+    Get stream_id from the highest priority active M3U provider for an episode.
+
+    Returns stream_id or None if no active provider found.
+    """
+    try:
+        # Get highest priority active relation
+        relation = M3UEpisodeRelation.objects.filter(
+            episode_id=episode.id,
+            m3u_account__is_active=True,
+        ).select_related('m3u_account').order_by(
+            '-m3u_account__priority', 'id'
+        ).first()
+
+        if relation:
+            return getattr(relation, 'stream_id', None)
+        return None
+    except Exception as e:
+        LOGGER.debug("Failed to get stream_id for episode id=%s: %s", episode.id, e)
+        return None
 
 
 def _ensure_dirs() -> None:
@@ -552,7 +602,12 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
 
     m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
+
+    # Get stream_id from highest priority provider
+    stream_id = _get_movie_stream_id(movie)
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
+    if stream_id:
+        url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -600,7 +655,12 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
+
+    # Get stream_id from highest priority provider
+    stream_id = _get_episode_stream_id(episode)
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
+    if stream_id:
+        url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -1311,7 +1371,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.6"
+    version = "0.0.7"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
