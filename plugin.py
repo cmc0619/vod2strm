@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.6
+Version: 0.0.7
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -9,7 +9,7 @@ Spec:
   * Movies -> <root>/Movies/{Name} ({Year})/{Name} ({Year}).strm
   * Series -> <root>/TV/{SeriesName (Year) or SeriesName + (year)}/Season {SS or 00}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
-  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}
+  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
 - NFO generation (compare-before-write):
   * Movies: movie.nfo in movie folder
   * Seasons: season.nfo per season folder
@@ -56,6 +56,7 @@ try:
         Series,
         Episode,
         M3UMovieRelation,
+        M3UEpisodeRelation,
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
@@ -65,6 +66,7 @@ except Exception:  # pragma: no cover
         Series,
         Episode,
         M3UMovieRelation,
+        M3UEpisodeRelation,
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
@@ -146,6 +148,58 @@ def _eligible_series_queryset():
     return Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
 
 
+def _get_movie_stream_id(movie: Movie) -> str | None:
+    """
+    Get stream_id from the highest priority active M3U provider for a movie.
+
+    Returns stream_id or None if no active provider found.
+    """
+    try:
+        # Get highest priority active relation
+        relation = M3UMovieRelation.objects.filter(
+            movie_id=movie.id,
+            m3u_account__is_active=True,
+        ).filter(
+            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+        ).select_related('m3u_account').order_by(
+            '-m3u_account__priority', 'id'
+        ).first()
+
+        if relation:
+            return getattr(relation, 'stream_id', None)
+        return None
+    except Exception as e:
+        LOGGER.debug("Failed to get stream_id for movie id=%s: %s", movie.id, e)
+        return None
+
+
+def _get_episode_stream_id(episode: Episode) -> str | None:
+    """
+    Get stream_id from the highest priority active M3U provider for an episode.
+    Filters by enabled categories to respect user's category preferences.
+
+    Returns stream_id or None if no active provider found.
+    """
+    try:
+        # Get highest priority active relation, filtering by enabled categories
+        # Same logic as _get_movie_stream_id to ensure consistency
+        relation = M3UEpisodeRelation.objects.filter(
+            episode_id=episode.id,
+            m3u_account__is_active=True,
+        ).filter(
+            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+        ).select_related('m3u_account').order_by(
+            '-m3u_account__priority', 'id'
+        ).first()
+
+        if relation:
+            return getattr(relation, 'stream_id', None)
+        return None
+    except Exception as e:
+        LOGGER.debug("Failed to get stream_id for episode id=%s: %s", episode.id, e)
+        return None
+
+
 def _ensure_dirs() -> None:
     Path(REPORT_ROOT).mkdir(parents=True, exist_ok=True)
     Path(LOG_ROOT).mkdir(parents=True, exist_ok=True)
@@ -184,7 +238,8 @@ def _load_manifest(root: Path) -> Dict[str, Any]:
     """
     Load manifest file or return default.
     Manifest tracks written files to avoid unnecessary disk writes.
-    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode"}}, "version": 1}
+    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode", "url": "..."}}, "version": 1}
+    Note: Including "url" field allows detection of URL changes (e.g., when stream_id parameter is added).
     """
     manifest_path = root / ".vod2strm_manifest.json"
     try:
@@ -386,7 +441,7 @@ def _write_if_changed(path: Path, content: bytes) -> Tuple[bool, str]:
 
 def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str, dry_run: bool = False) -> Tuple[bool, str]:
     """
-    Write .strm file only if UUID changed or file doesn't exist in manifest.
+    Write .strm file only if UUID, URL, or type changed, or file doesn't exist in manifest.
     Checks manifest first to avoid disk reads when possible.
 
     Returns (written, reason)
@@ -396,11 +451,16 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     manifest_files = manifest.get("files", {})
 
     # Check manifest cache first - avoid disk I/O entirely
+    # Include URL in cache check to detect when stream_id or other URL params change
     cache_matches = False
     with _MANIFEST_LOCK:
         if path_str in manifest_files:
             cached_entry = manifest_files[path_str]
-            cache_matches = cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type
+            cache_matches = (
+                cached_entry.get("uuid") == uuid and
+                cached_entry.get("type") == file_type and
+                cached_entry.get("url") == url
+            )
 
     # If cache matches, verify file exists (outside lock to minimize lock time)
     if cache_matches:
@@ -409,7 +469,7 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
         # Manifest is stale - file was deleted/corrupted
         LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
 
-    # UUID changed or not in manifest
+    # UUID, URL, or type changed, or not in manifest
     if dry_run:
         # Don't write, but report what would happen
         with _MANIFEST_LOCK:
@@ -421,10 +481,10 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
 
-    # Update manifest
+    # Update manifest - include URL so we can detect URL changes on next run
     with _MANIFEST_LOCK:
         is_new = path_str not in manifest_files
-        manifest_files[path_str] = {"uuid": uuid, "type": file_type}
+        manifest_files[path_str] = {"uuid": uuid, "type": file_type, "url": url}
 
     return (True, "created" if is_new else "updated")
 
@@ -552,7 +612,12 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
 
     m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
+
+    # Get stream_id from highest priority provider
+    stream_id = _get_movie_stream_id(movie)
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
+    if stream_id:
+        url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -600,7 +665,12 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     e_folder = s_folder / _season_folder_name(season_number)
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
+
+    # Get stream_id from highest priority provider
+    stream_id = _get_episode_stream_id(episode)
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
+    if stream_id:
+        url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -1311,7 +1381,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.6"
+    version = "0.0.7"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
