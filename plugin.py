@@ -234,7 +234,8 @@ def _load_manifest(root: Path) -> Dict[str, Any]:
     """
     Load manifest file or return default.
     Manifest tracks written files to avoid unnecessary disk writes.
-    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode"}}, "version": 1}
+    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode", "url": "..."}}, "version": 1}
+    Note: Including "url" field allows detection of URL changes (e.g., when stream_id parameter is added).
     """
     manifest_path = root / ".vod2strm_manifest.json"
     try:
@@ -436,7 +437,7 @@ def _write_if_changed(path: Path, content: bytes) -> Tuple[bool, str]:
 
 def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str, dry_run: bool = False) -> Tuple[bool, str]:
     """
-    Write .strm file only if UUID changed or file doesn't exist in manifest.
+    Write .strm file only if UUID, URL, or type changed, or file doesn't exist in manifest.
     Checks manifest first to avoid disk reads when possible.
 
     Returns (written, reason)
@@ -446,11 +447,16 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     manifest_files = manifest.get("files", {})
 
     # Check manifest cache first - avoid disk I/O entirely
+    # Include URL in cache check to detect when stream_id or other URL params change
     cache_matches = False
     with _MANIFEST_LOCK:
         if path_str in manifest_files:
             cached_entry = manifest_files[path_str]
-            cache_matches = cached_entry.get("uuid") == uuid and cached_entry.get("type") == file_type
+            cache_matches = (
+                cached_entry.get("uuid") == uuid and
+                cached_entry.get("type") == file_type and
+                cached_entry.get("url") == url
+            )
 
     # If cache matches, verify file exists (outside lock to minimize lock time)
     if cache_matches:
@@ -459,7 +465,7 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
         # Manifest is stale - file was deleted/corrupted
         LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
 
-    # UUID changed or not in manifest
+    # UUID, URL, or type changed, or not in manifest
     if dry_run:
         # Don't write, but report what would happen
         with _MANIFEST_LOCK:
@@ -471,10 +477,10 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
 
-    # Update manifest
+    # Update manifest - include URL so we can detect URL changes on next run
     with _MANIFEST_LOCK:
         is_new = path_str not in manifest_files
-        manifest_files[path_str] = {"uuid": uuid, "type": file_type}
+        manifest_files[path_str] = {"uuid": uuid, "type": file_type, "url": url}
 
     return (True, "created" if is_new else "updated")
 
