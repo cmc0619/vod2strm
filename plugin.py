@@ -47,7 +47,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any
 
-from django.db import connection, transaction  # noqa:F401
+from django.db import connection, transaction
 from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.utils.timezone import now  # noqa:F401
 
@@ -223,9 +223,10 @@ def _get_stream_id_from_prefetch(instance, relation_attr: str = 'active_relation
             # Prefetch should order by priority, so first item is highest priority
             relation = relations[0]
             return getattr(relation, 'stream_id', None)
-        return None
-    except Exception as e:
+    except (AttributeError, IndexError, TypeError) as e:
         LOGGER.debug("Failed to get stream_id from prefetch: %s", e)
+        return None
+    else:
         return None
 
 
