@@ -1461,7 +1461,7 @@ class Plugin:
             "label": "Base URL (for .strm)",
             "type": "string",
             "default": DEFAULT_BASE_URL,
-            "help": "e.g., http://192.168.199.10:9191",
+            "help": "e.g., http://localhost:9191 or http://dispatcharr:9191",
             "required": True,
         },
         {
