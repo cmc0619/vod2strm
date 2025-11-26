@@ -36,7 +36,10 @@ import logging
 import logging.handlers
 import math
 import os
-import re
+try:
+    import regex as re  # Use regex library for better Unicode support (aligns with Dispatcharr)
+except ImportError:
+    import re  # Fallback to standard library if regex not available
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
