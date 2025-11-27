@@ -22,7 +22,6 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 - **Compare-Before-Write**: Only writes when content changes (hash-based comparison for NFO files)
 
 ### Automation
-- **Scheduled Runs**: Optional Celery beat scheduling with crontab or `daily HH:MM` syntax
 - **Auto-run After VOD Refresh**: Optionally trigger generation automatically when Dispatcharr refreshes VOD content (30-second debounce)
 
 ### Debugging & Reports
@@ -62,7 +61,6 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 | **Auto-run after VOD Refresh** | Boolean | ☐ | Automatically generate files when Dispatcharr refreshes VOD content |
 | **Dry Run** | Boolean | ☐ | Simulate without writing (testing mode) |
 | **Robust debug logging** | Boolean | ☐ | Enable verbose logging to `/data/plugins/vod2strm/logs/` |
-| **Schedule** | Text | (blank) | `daily HH:MM` or `0 30 3 * * *` (crontab) for Celery beat |
 
 ## Actions
 
@@ -123,11 +121,6 @@ Rotating log files with debug information (when enabled).
 - Only new content or changed metadata triggers writes
 - Minimal SD card/NAS wear
 
-### Scheduled Daily Runs
-- Set **Schedule** to `daily 03:00` for automatic 3am generation
-- Enable **Auto-run after VOD Refresh** to auto-generate when Dispatcharr adds new content
-- Disable **Dry Run** for scheduled runs (always runs for real)
-
 ## Safety Notes
 
 - ✅ Read-only access to Dispatcharr database (no modifications)
@@ -158,8 +151,7 @@ Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
 ## Versioning
 
 Semantic versioning: `MAJOR.MINOR.PATCH`
-- Current: `0.0.2`
-- Increments: `0.0.3`, `0.0.4`, etc.
+- Current: `0.0.8`
 
 ## License
 
