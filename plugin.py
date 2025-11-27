@@ -770,10 +770,11 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
     manifest_files = manifest.get("files", {})
-    movie_uuids = set(_eligible_movie_queryset().values_list("uuid", flat=True))
+    # Convert UUIDs to strings for comparison with regex-extracted UUID strings
+    movie_uuids = set(str(u) for u in _eligible_movie_queryset().values_list("uuid", flat=True))
     allowed_series_ids = _eligible_series_queryset().values_list("id", flat=True)
     episode_uuids = set(
-        Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
+        str(u) for u in Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
     )
 
     def check_one(p: Path):
