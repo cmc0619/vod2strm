@@ -1445,7 +1445,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.8"
+    version = "0.0.9"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
