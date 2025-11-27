@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.7
+Version: 0.0.8
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -36,7 +36,10 @@ import logging
 import logging.handlers
 import math
 import os
-import re
+try:
+    import regex as re  # Use regex library for better Unicode support (aligns with Dispatcharr)
+except ImportError:
+    import re  # Fallback to standard library if regex not available
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,9 +47,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any
 
-from django.conf import settings as dj_settings  # noqa:F401  (kept for future use)
-from django.db import connection, transaction  # noqa:F401
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db import connection, transaction
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.utils.timezone import now  # noqa:F401
 
 # ORM models (plugin runs in-process with the app)
@@ -82,7 +84,7 @@ except Exception:  # pragma: no cover
 
 # -------------------- Constants / Defaults --------------------
 
-DEFAULT_BASE_URL = "http://192.168.199.10:9191"
+DEFAULT_BASE_URL = "http://localhost:9191"
 DEFAULT_ROOT = "/data/STRM"
 
 REPORT_ROOT = "/data/plugins/vod2strm/reports"
@@ -197,6 +199,34 @@ def _get_episode_stream_id(episode: Episode) -> str | None:
         return None
     except Exception as e:
         LOGGER.debug("Failed to get stream_id for episode id=%s: %s", episode.id, e)
+        return None
+
+
+def _get_stream_id_from_prefetch(instance, relation_attr: str = 'active_relation') -> str | None:
+    """
+    Extract stream_id from prefetched relation on a Movie or Episode instance.
+
+    Expects the instance to have a prefetched attribute containing the highest
+    priority active M3U relation. This avoids N+1 queries.
+
+    Args:
+        instance: Movie or Episode instance with prefetched relation
+        relation_attr: Name of the prefetched attribute (default: 'active_relation')
+
+    Returns:
+        stream_id or None if no relation found
+    """
+    try:
+        # Access prefetched relation - this doesn't trigger a DB query
+        relations = getattr(instance, relation_attr, [])
+        if relations:
+            # Prefetch should order by priority, so first item is highest priority
+            relation = relations[0]
+            return getattr(relation, 'stream_id', None)
+    except (AttributeError, IndexError, TypeError) as e:
+        LOGGER.debug("Failed to get stream_id from prefetch: %s", e)
+        return None
+    else:
         return None
 
 
@@ -543,9 +573,11 @@ def _nfo_season(s: Series, season_number: int, clean_series_name: str | None = N
     return xml.getvalue().encode("utf-8")
 
 
-def _nfo_episode(e: Episode) -> bytes:
+def _nfo_episode(e: Episode, clean_name: str | None = None) -> bytes:
+    # Use clean_name if provided (for title tag), otherwise fall back to DB name
+    title = clean_name if clean_name else (e.name or "")
     fields = {
-        "title": e.name or "",
+        "title": title,
         "season": str(getattr(e, "season_number", "") or ""),
         "episode": str(getattr(e, "episode_number", "") or ""),
         "aired": str(getattr(e, "air_date", "") or ""),
@@ -613,8 +645,13 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
     m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
 
-    # Get stream_id from highest priority provider
-    stream_id = _get_movie_stream_id(movie)
+    # Get stream_id from prefetched relation (avoids N+1 query)
+    # Falls back to query if prefetch not available (backward compatibility)
+    stream_id = _get_stream_id_from_prefetch(movie, 'active_relation')
+    if stream_id is None:
+        # Fallback to query if prefetch not available
+        stream_id = _get_movie_stream_id(movie)
+
     url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
     if stream_id:
         url = f"{url}?stream_id={stream_id}"
@@ -666,8 +703,13 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
 
-    # Get stream_id from highest priority provider
-    stream_id = _get_episode_stream_id(episode)
+    # Get stream_id from prefetched relation (avoids N+1 query)
+    # Falls back to query if prefetch not available (backward compatibility)
+    stream_id = _get_stream_id_from_prefetch(episode, 'active_relation')
+    if stream_id is None:
+        # Fallback to query if prefetch not available
+        stream_id = _get_episode_stream_id(episode)
+
     url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
     if stream_id:
         url = f"{url}?stream_id={stream_id}"
@@ -709,7 +751,9 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         # episode nfo
         ep_start = time.time()
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
-        ep_nfo_bytes = _nfo_episode(episode)
+        # Pass cleaned episode name for consistency with movie/season NFO generation
+        episode_name = _clean_name(getattr(episode, "name", "") or "", clean_regex)
+        ep_nfo_bytes = _nfo_episode(episode, clean_name=episode_name)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
         if wrote_e and throttle:
             throttle.record_write(time.time() - ep_start)
@@ -726,10 +770,11 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
     """
     LOGGER.info("Cleanup started (apply=%s)", apply)
     manifest_files = manifest.get("files", {})
-    movie_uuids = set(_eligible_movie_queryset().values_list("uuid", flat=True))
+    # Convert UUIDs to strings for comparison with regex-extracted UUID strings
+    movie_uuids = set(str(u) for u in _eligible_movie_queryset().values_list("uuid", flat=True))
     allowed_series_ids = _eligible_series_queryset().values_list("id", flat=True)
     episode_uuids = set(
-        Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
+        str(u) for u in Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
     )
 
     def check_one(p: Path):
@@ -899,7 +944,17 @@ def _run_job_sync(
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s)", dry_run, adaptive_throttle, clean_regex)
     # Only generate .strm files for movies with active provider relations
-    qs = _eligible_movie_queryset().only(
+    # Prefetch M3UMovieRelation to avoid N+1 queries (one query per movie)
+    # Prefetch only highest priority active relation with enabled category
+    active_movie_relations = M3UMovieRelation.objects.filter(
+        m3u_account__is_active=True,
+    ).filter(
+        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+    ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
+
+    qs = _eligible_movie_queryset().prefetch_related(
+        Prefetch('m3u_relations', queryset=active_movie_relations, to_attr='active_relation')
+    ).only(
         "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo"
     )
     work = list(qs)
@@ -1150,6 +1205,13 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
             # Only generate episodes that have active provider relations
             # Workaround for Dispatcharr issue #569: Use .distinct() to handle duplicate M3UEpisodeRelation records
+            # Prefetch M3UEpisodeRelation to avoid N+1 queries (one query per episode)
+            active_episode_relations = M3UEpisodeRelation.objects.filter(
+                m3u_account__is_active=True,
+            ).filter(
+                Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+            ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
+
             eps_query = Episode.objects.filter(
                 series_id=s.id,
                 m3u_relations__m3u_account__is_active=True
@@ -1157,7 +1219,9 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
             # Check for duplicate relations (issue #569 detection)
             total_before_distinct = eps_query.count()
-            eps = list(eps_query.distinct().only(
+            eps = list(eps_query.distinct().prefetch_related(
+                Prefetch('m3u_relations', queryset=active_episode_relations, to_attr='active_relation')
+            ).only(
                 "id", "uuid", "name", "season_number", "episode_number",
                 "air_date", "description", "rating", "tmdb_id", "imdb_id"
             ).order_by("season_number", "episode_number"))
@@ -1381,7 +1445,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.7"
+    version = "0.0.9"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1398,7 +1462,7 @@ class Plugin:
             "label": "Base URL (for .strm)",
             "type": "string",
             "default": DEFAULT_BASE_URL,
-            "help": "e.g., http://192.168.199.10:9191",
+            "help": "e.g., http://localhost:9191 or http://dispatcharr:9191",
             "required": True,
         },
         {
@@ -1450,14 +1514,7 @@ class Plugin:
             "label": "Dry Run (simulate without writing)",
             "type": "boolean",
             "default": False,
-            "help": "Simulate generation without creating/modifying files. Useful for testing. Scheduled runs ignore this and always run for real.",
-        },
-        {
-            "id": "schedule",
-            "label": "Schedule (crontab string or 'daily HH:MM')",
-            "type": "string",
-            "default": "",
-            "help": "Leave blank to disable. Example: 'daily 03:30' or '0 30 3 * * *'",
+            "help": "Simulate generation without creating/modifying files. Useful for testing.",
         },
         {
             "id": "name_clean_regex",
@@ -1544,54 +1601,6 @@ class Plugin:
             return {"status": "ok", "message": msg}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
-
-    def on_settings_saved(self, settings):
-        """
-        When settings are saved, (re)register a periodic Celery schedule if provided.
-        """
-        _configure_file_logger(settings.get("debug_logging", False))
-        sched = (settings.get("schedule") or "").strip()
-        if not sched:
-            LOGGER.info("No schedule configured; skipping Celery beat registration.")
-            return
-
-        try:
-            if celery_app is None:
-                LOGGER.warning("Celery app not available; cannot register schedule.")
-                return
-
-            beat_key = "vod2strm.periodic_generate_all"
-            celery_app.conf.beat_schedule = celery_app.conf.beat_schedule or {}
-
-            if sched.lower().startswith("daily"):
-                hhmm = sched.split(" ", 1)[1].strip() if " " in sched else "03:30"
-                hour, minute = [int(x) for x in hhmm.split(":")]
-                celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "vod2strm.plugin.generate_all",
-                    "schedule": {"type": "crontab", "hour": hour, "minute": minute},
-                    "args": [],
-                }
-            else:
-                parts = sched.split()
-                if len(parts) == 6:
-                    sec, minute, hour, dom, mon, dow = parts
-                elif len(parts) == 5:
-                    minute, hour, dom, mon, dow = parts
-                    sec = "0"
-                else:
-                    raise ValueError("Invalid schedule format")
-                celery_app.conf.beat_schedule[beat_key] = {
-                    "task": "vod2strm.plugin.generate_all",
-                    "schedule": {
-                        "type": "crontab",
-                        "minute": minute, "hour": hour,
-                        "day_of_month": dom, "month_of_year": mon, "day_of_week": dow,
-                    },
-                    "args": [],
-                }
-            LOGGER.info("Registered Celery beat: %s -> %s", sched, beat_key)
-        except Exception as e:  # pragma: no cover
-            LOGGER.warning("Failed to register schedule: %s", e)
 
     def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None):
         args = {
@@ -1722,6 +1731,11 @@ def _schedule_auto_run_after_vod_refresh():
         if not plugin_config or not plugin_config.settings:
             return
 
+        # Check if plugin is enabled (respects UI disable toggle)
+        if not plugin_config.enabled:
+            LOGGER.debug("Auto-run skipped: plugin is disabled")
+            return
+
         settings = plugin_config.settings
         if not settings.get("auto_run_after_vod_refresh", False):
             return  # Feature disabled
@@ -1736,6 +1750,8 @@ def _schedule_auto_run_after_vod_refresh():
                 """
                 Execute debounced STRM generation job.
 
+                Reloads settings from database to avoid using stale settings captured
+                in closure. Re-checks plugin enabled state before executing.
                 Sets _auto_run_in_progress flag to prevent signal handlers from
                 triggering another auto-run while this one is executing. Flag is
                 cleared in finally block to ensure it's reset even on errors.
@@ -1744,17 +1760,32 @@ def _schedule_auto_run_after_vod_refresh():
                 LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
                 _auto_run_in_progress = True
                 try:
+                    # Reload settings from database (avoid stale settings from closure)
+                    from apps.plugins.models import PluginConfig
+                    plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
+
+                    # Double-check plugin is still enabled before running
+                    if not plugin_config or not plugin_config.enabled:
+                        LOGGER.info("Auto-run cancelled: plugin was disabled during debounce window")
+                        return
+
+                    # Double-check auto-run is still enabled
+                    current_settings = plugin_config.settings or {}
+                    if not current_settings.get("auto_run_after_vod_refresh", False):
+                        LOGGER.info("Auto-run cancelled: feature was disabled during debounce window")
+                        return
+
                     _run_job_sync(
                         mode="all",
-                        output_root=settings.get("output_root") or DEFAULT_ROOT,
-                        base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-                        write_nfos=bool(settings.get("write_nfos", True)),
-                        cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-                        concurrency=int(settings.get("concurrency") or 4),
-                        debug_logging=bool(settings.get("debug_logging", False)),
+                        output_root=current_settings.get("output_root") or DEFAULT_ROOT,
+                        base_url=current_settings.get("base_url") or DEFAULT_BASE_URL,
+                        write_nfos=bool(current_settings.get("write_nfos", True)),
+                        cleanup_mode=current_settings.get("cleanup_mode", CLEANUP_OFF),
+                        concurrency=int(current_settings.get("concurrency") or 4),
+                        debug_logging=bool(current_settings.get("debug_logging", False)),
                         dry_run=False,
-                        adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-                        clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
+                        adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
+                        clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
                     )
                 finally:
                     _auto_run_in_progress = False
