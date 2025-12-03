@@ -54,6 +54,7 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 |---------|------|---------|-------------|
 | **Output Root Folder** | Text | `/data/STRM` | Destination for `.strm` and `.nfo` files |
 | **Base URL (for .strm)** | Text | `http://dispatcharr:9191` | URL written inside each `.strm` file |
+| **Use Direct URLs** | Boolean | ☐ | Write provider URLs directly instead of Dispatcharr proxy URLs |
 | **Write NFO files** | Boolean | ✅ | Generate NFO metadata alongside `.strm` files |
 | **Cleanup** | Select | Off | Off / Preview / Apply – removes stale files |
 | **Max Filesystem Concurrency** | Number | 4 | Maximum concurrent file operations (adaptive throttling adjusts automatically) |
@@ -151,7 +152,7 @@ Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
 ## Versioning
 
 Semantic versioning: `MAJOR.MINOR.PATCH`
-- Current: `0.0.9`
+- Current: `0.0.10`
 
 ## License
 

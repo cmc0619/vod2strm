@@ -230,6 +230,30 @@ def _get_stream_id_from_prefetch(instance, relation_attr: str = 'active_relation
         return None
 
 
+def _get_relation_from_prefetch(instance, relation_attr: str = 'active_relation'):
+    """
+    Get the prefetched relation object from a Movie or Episode instance.
+
+    Expects the instance to have a prefetched attribute containing the highest
+    priority active M3U relation. This avoids N+1 queries.
+
+    Args:
+        instance: Movie or Episode instance with prefetched relation
+        relation_attr: Name of the prefetched attribute (default: 'active_relation')
+
+    Returns:
+        M3UMovieRelation or M3UEpisodeRelation object, or None if not found
+    """
+    try:
+        relations = getattr(instance, relation_attr, [])
+        if relations:
+            return relations[0]
+    except (AttributeError, IndexError, TypeError) as e:
+        LOGGER.debug("Failed to get relation from prefetch: %s", e)
+        return None
+    return None
+
+
 def _ensure_dirs() -> None:
     Path(REPORT_ROOT).mkdir(parents=True, exist_ok=True)
     Path(LOG_ROOT).mkdir(parents=True, exist_ok=True)
@@ -637,7 +661,7 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None) -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False) -> None:
     # Use name field - title field doesn't exist in Movie model
     raw_name = movie.name or ""
     movie_name = _clean_name(raw_name, clean_regex)
@@ -645,16 +669,27 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
     m_folder = root / "Movies" / _movie_folder_name(movie_name, getattr(movie, "year", None))
     strm_path = m_folder / f"{_movie_folder_name(movie_name, getattr(movie, 'year', None))}.strm"
 
-    # Get stream_id from prefetched relation (avoids N+1 query)
-    # Falls back to query if prefetch not available (backward compatibility)
-    stream_id = _get_stream_id_from_prefetch(movie, 'active_relation')
-    if stream_id is None:
-        # Fallback to query if prefetch not available
-        stream_id = _get_movie_stream_id(movie)
+    # Get relation from prefetch (for both stream_id and direct URL)
+    relation = _get_relation_from_prefetch(movie, 'active_relation')
+    stream_id = getattr(relation, 'stream_id', None) if relation else None
 
-    url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
-    if stream_id:
-        url = f"{url}?stream_id={stream_id}"
+    # Fallback to query if prefetch not available
+    if stream_id is None:
+        stream_id = _get_movie_stream_id(movie)
+        relation = None  # Can't use direct URL without relation
+
+    # Build URL - either direct provider URL or proxy URL
+    if use_direct_urls and relation:
+        url = relation.get_stream_url()
+        if not url:
+            # Fallback to proxy if direct URL not available (non-XC account)
+            url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
+            if stream_id:
+                url = f"{url}?stream_id={stream_id}"
+    else:
+        url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
+        if stream_id:
+            url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -676,7 +711,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", raw_name, getattr(movie, "year", ""), str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, clean_regex: str | None = None) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False) -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -703,16 +738,27 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     strm_name = _episode_filename(episode)
     strm_path = e_folder / strm_name
 
-    # Get stream_id from prefetched relation (avoids N+1 query)
-    # Falls back to query if prefetch not available (backward compatibility)
-    stream_id = _get_stream_id_from_prefetch(episode, 'active_relation')
-    if stream_id is None:
-        # Fallback to query if prefetch not available
-        stream_id = _get_episode_stream_id(episode)
+    # Get relation from prefetch (for both stream_id and direct URL)
+    relation = _get_relation_from_prefetch(episode, 'active_relation')
+    stream_id = getattr(relation, 'stream_id', None) if relation else None
 
-    url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
-    if stream_id:
-        url = f"{url}?stream_id={stream_id}"
+    # Fallback to query if prefetch not available
+    if stream_id is None:
+        stream_id = _get_episode_stream_id(episode)
+        relation = None  # Can't use direct URL without relation
+
+    # Build URL - either direct provider URL or proxy URL
+    if use_direct_urls and relation:
+        url = relation.get_stream_url()
+        if not url:
+            # Fallback to proxy if direct URL not available (non-XC account)
+            url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
+            if stream_id:
+                url = f"{url}?stream_id={stream_id}"
+    else:
+        url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
+        if stream_id:
+            url = f"{url}?stream_id={stream_id}"
 
     # Time the write operation for adaptive throttling
     start_time = time.time()
@@ -900,10 +946,11 @@ def _run_job_sync(
     dry_run: bool = False,
     adaptive_throttle: bool = True,
     clean_regex: str | None = None,
+    use_direct_urls: bool = False,
 ) -> None:
     _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s",
+                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
 
     root = Path(output_root)
     ts = _ts()
@@ -925,10 +972,10 @@ def _run_job_sync(
                     LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
         if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex)
+            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
 
         if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex)
+            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
@@ -941,8 +988,8 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None) -> None:
-    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s)", dry_run, adaptive_throttle, clean_regex)
+def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False) -> None:
+    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", dry_run, adaptive_throttle, clean_regex, use_direct_urls)
     # Only generate .strm files for movies with active provider relations
     # Prefetch M3UMovieRelation to avoid N+1 queries (one query per movie)
     # Prefetch only highest priority active relation with enabled category
@@ -973,7 +1020,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
         def job(m: Movie) -> None:
             try:
-                _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, clean_regex)
+                _make_movie_strm_and_nfo(m, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, clean_regex, use_direct_urls)
             except Exception as e:
                 LOGGER.warning("Movie id=%s failed: %s", m.id, e)
                 with lock:
@@ -1164,8 +1211,8 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
         return False
 
 
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None) -> None:
-    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s)", dry_run, adaptive_throttle, clean_regex)
+def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False) -> None:
+    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", dry_run, adaptive_throttle, clean_regex, use_direct_urls)
     # Only generate .strm files for series with active provider relations
     # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
     series_qs = _eligible_series_queryset().annotate(
@@ -1249,7 +1296,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 current_workers = throttle.get_workers()
 
                 def job(e: Episode) -> None:
-                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, written_seasons, clean_regex)
+                    _make_episode_strm_and_nfo(s, e, base_url, root, write_nfos, rows, lock, manifest, dry_run, throttle, written_seasons, clean_regex, use_direct_urls)
 
                 with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
                     list(ex.map(job, batch))
@@ -1445,7 +1492,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.9"
+    version = "0.0.10"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1464,6 +1511,13 @@ class Plugin:
             "default": DEFAULT_BASE_URL,
             "help": "e.g., http://localhost:9191 or http://dispatcharr:9191",
             "required": True,
+        },
+        {
+            "id": "use_direct_urls",
+            "label": "Use Direct URLs",
+            "type": "boolean",
+            "default": False,
+            "help": "Write provider URLs directly instead of Dispatcharr proxy URLs.",
         },
         {
             "id": "write_nfos",
@@ -1559,9 +1613,10 @@ class Plugin:
         dry_run = bool(settings.get("dry_run", False))
         adaptive_throttle = bool(settings.get("adaptive_throttle", True))
         clean_regex = (settings.get("name_clean_regex") or "").strip() or None
+        use_direct_urls = bool(settings.get("use_direct_urls", False))
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s",
+                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
 
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
@@ -1585,24 +1640,24 @@ class Plugin:
                 return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
             return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
             msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
             msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex)
+            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
             msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
             return {"status": "ok", "message": msg}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False):
         args = {
             "mode": mode,
             "output_root": str(output_root),
@@ -1614,6 +1669,7 @@ class Plugin:
             "dry_run": dry_run,
             "adaptive_throttle": adaptive_throttle,
             "clean_regex": clean_regex,
+            "use_direct_urls": use_direct_urls,
         }
 
         # REASONING: Threading fallback removed
@@ -1629,7 +1685,7 @@ class Plugin:
 
         # Call the task using delay() - standard Celery pattern
         celery_run_job.delay(args)
-        LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s)", mode, dry_run, adaptive_throttle, clean_regex)
+        LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
 
 
 # -------------------- Celery task registration --------------------
@@ -1686,6 +1742,7 @@ if shared_task is not None:
                 debug_logging=bool(settings.get("debug_logging", False)),
                 dry_run=False,  # Scheduled runs always run for real
                 clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
+                use_direct_urls=bool(settings.get("use_direct_urls", False)),
             )
             LOGGER.info("Celery scheduled task generate_all completed successfully")
         except Exception as e:
@@ -1786,6 +1843,7 @@ def _schedule_auto_run_after_vod_refresh():
                         dry_run=False,
                         adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
                         clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
+                        use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
                     )
                 finally:
                     _auto_run_in_progress = False
@@ -1844,7 +1902,32 @@ try:
         if created and not _auto_run_in_progress:
             _schedule_auto_run_after_vod_refresh()
 
-    LOGGER.info("VOD refresh signal handlers registered")
+    # Listen for new provider relations (catches "same content, new provider" scenario)
+    # When a user adds a new provider or enables groups, M3UMovieRelation/M3UEpisodeRelation
+    # records are created linking existing content to the new provider.
+    @receiver(post_save, sender=M3UMovieRelation)
+    def on_movie_relation_saved(sender, instance, created, **kwargs):
+        """
+        Django signal handler triggered when M3UMovieRelation is saved.
+
+        Schedules auto-run when new provider relations are created. This catches
+        the scenario where existing movies get linked to a new/higher priority provider.
+        """
+        if created and not _auto_run_in_progress:
+            _schedule_auto_run_after_vod_refresh()
+
+    @receiver(post_save, sender=M3UEpisodeRelation)
+    def on_episode_relation_saved(sender, instance, created, **kwargs):
+        """
+        Django signal handler triggered when M3UEpisodeRelation is saved.
+
+        Schedules auto-run when new provider relations are created. This catches
+        the scenario where existing episodes get linked to a new/higher priority provider.
+        """
+        if created and not _auto_run_in_progress:
+            _schedule_auto_run_after_vod_refresh()
+
+    LOGGER.info("VOD refresh signal handlers registered (including provider relation handlers)")
 
 except ImportError:
     LOGGER.warning("Could not register VOD refresh signal handlers (Django signals not available)")
