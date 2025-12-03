@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.8
+Version: 0.0.11
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -863,10 +863,20 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
 
     def check_one(p: Path):
         try:
+            # Prefer manifest as source of truth (works for both proxy and direct URLs)
+            path_str = str(p)
+            cached = manifest_files.get(path_str)
+            if cached:
+                typ = cached.get("type")
+                uid = cached.get("uuid")
+                if typ in ("movie", "episode") and uid:
+                    present = (uid in movie_uuids) if typ == "movie" else (uid in episode_uuids)
+                    return ("ok", (typ, uid, present))
+
+            # Fallback for legacy files or ones not tracked in manifest
             data = p.read_text(encoding="utf-8", errors="ignore").strip()
             # Simple UUID extraction pattern: [a-f0-9-]+
-            # We control .strm generation, so UUIDs are always valid UUID v4 format.
-            # No need for strict validation - simpler pattern = faster when scanning 1000s of files.
+            # We control .strm generation in proxy mode, so UUIDs are always valid UUID v4 format.
             m = re.search(r"/proxy/vod/(movie|episode)/([a-f0-9-]+)", data, flags=re.I)
             if not m:
                 return ("unknown", None)
@@ -1530,7 +1540,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.10"
+    version = "0.0.11"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
