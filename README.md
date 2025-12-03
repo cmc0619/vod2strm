@@ -61,6 +61,29 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 | **Auto-run after VOD Refresh** | Boolean | ☐ | Automatically generate files when Dispatcharr refreshes VOD content |
 | **Dry Run** | Boolean | ☐ | Simulate without writing (testing mode) |
 | **Robust debug logging** | Boolean | ☐ | Enable verbose logging to `/data/plugins/vod2strm/logs/` |
+| **Name Cleaning Regex** | Text | (empty) | Optional regex to strip patterns from names (e.g., `^(?:EN\|TOP)\s*-\s*`) |
+| **Content Filter: Movie IDs** | Text | (empty) | Comma-separated database IDs to include (e.g., `123,456`). Empty = generate all |
+| **Content Filter: Series IDs** | Text | (empty) | Comma-separated database IDs to include (e.g., `789,012`). Empty = generate all |
+
+## Content Filtering
+
+Filter specific movies or series by database ID instead of generating everything.
+
+### Finding Content IDs
+
+Content IDs are available in the Dispatcharr database. You can find them by:
+- Browsing your Dispatcharr VOD library UI (IDs visible in URLs or via browser dev tools)
+- Using database queries if you have direct access
+- Using the Dispatcharr API
+
+### Using Content Filters
+
+1. **Get the database IDs** for content you want to include
+2. **Add IDs to plugin settings**:
+   - Navigate to **Plugins → vod2strm**
+   - Enter comma-separated IDs in **Content Filter: Movie IDs**: `123,456,789`
+   - Enter comma-separated IDs in **Content Filter: Series IDs**: `321,654,987`
+3. **Generate .strm files**: Click **Generate All**
 
 ## Actions
 

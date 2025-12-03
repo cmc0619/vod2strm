@@ -126,7 +126,10 @@ def _enabled_category_subquery(account_field: str, category_field: str) -> Exist
 
 def _eligible_movie_queryset():
     """
-    Movies that have at least one active account relation and belong to an enabled group.
+    Movies with active account relations AND optional content filter.
+
+    Content filter: Comma-separated database IDs from plugin settings.
+    When filter is empty, all eligible movies are included.
     """
     allowed_relations = M3UMovieRelation.objects.filter(
         movie_id=OuterRef("pk"),
@@ -134,12 +137,32 @@ def _eligible_movie_queryset():
     ).filter(
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
     )
-    return Movie.objects.annotate(_vod2_allowed_movie=Exists(allowed_relations)).filter(_vod2_allowed_movie=True)
+    base_qs = Movie.objects.annotate(_vod2_allowed_movie=Exists(allowed_relations)).filter(_vod2_allowed_movie=True)
+
+    # Load content filter settings from plugin config
+    try:
+        from apps.plugins.models import PluginConfig
+        config = PluginConfig.objects.filter(key="vod2strm").first()
+        settings = config.settings if config else {}
+        filter_movie_ids_str = settings.get("filter_movie_ids", "").strip()
+    except Exception:
+        filter_movie_ids_str = ""
+
+    # Parse UI IDs
+    if filter_movie_ids_str:
+        ui_ids = [int(x.strip()) for x in filter_movie_ids_str.split(',') if x.strip().isdigit()]
+        if ui_ids:
+            base_qs = base_qs.filter(id__in=ui_ids)
+
+    return base_qs
 
 
 def _eligible_series_queryset():
     """
-    Series that have at least one active account relation and belong to an enabled group.
+    Series with active account relations AND optional content filter.
+
+    Content filter: Comma-separated database IDs from plugin settings.
+    When filter is empty, all eligible series are included.
     """
     allowed_relations = M3USeriesRelation.objects.filter(
         series_id=OuterRef("pk"),
@@ -147,7 +170,24 @@ def _eligible_series_queryset():
     ).filter(
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
     )
-    return Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
+    base_qs = Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
+
+    # Load content filter settings from plugin config
+    try:
+        from apps.plugins.models import PluginConfig
+        config = PluginConfig.objects.filter(key="vod2strm").first()
+        settings = config.settings if config else {}
+        filter_series_ids_str = settings.get("filter_series_ids", "").strip()
+    except Exception:
+        filter_series_ids_str = ""
+
+    # Parse UI IDs
+    if filter_series_ids_str:
+        ui_ids = [int(x.strip()) for x in filter_series_ids_str.split(',') if x.strip().isdigit()]
+        if ui_ids:
+            base_qs = base_qs.filter(id__in=ui_ids)
+
+    return base_qs
 
 
 def _get_movie_stream_id(movie: Movie) -> str | None:
@@ -178,18 +218,16 @@ def _get_movie_stream_id(movie: Movie) -> str | None:
 def _get_episode_stream_id(episode: Episode) -> str | None:
     """
     Get stream_id from the highest priority active M3U provider for an episode.
-    Filters by enabled categories to respect user's category preferences.
 
     Returns stream_id or None if no active provider found.
     """
     try:
-        # Get highest priority active relation, filtering by enabled categories
-        # Same logic as _get_movie_stream_id to ensure consistency
+        # Get highest priority active relation
+        # NOTE: M3UEpisodeRelation has no category_id field (unlike M3UMovieRelation/M3USeriesRelation)
+        # Episodes inherit category from parent series, so we don't filter by category here
         relation = M3UEpisodeRelation.objects.filter(
             episode_id=episode.id,
             m3u_account__is_active=True,
-        ).filter(
-            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
         ).select_related('m3u_account').order_by(
             '-m3u_account__priority', 'id'
         ).first()
@@ -1203,18 +1241,18 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
                 continue
 
-            # Only generate episodes that have active provider relations
+            # Generate episodes for the series
+            # If episodes have M3U relations, use those for stream IDs
+            # Otherwise, use series stream URL (provider may not have episode-level streams)
             # Workaround for Dispatcharr issue #569: Use .distinct() to handle duplicate M3UEpisodeRelation records
             # Prefetch M3UEpisodeRelation to avoid N+1 queries (one query per episode)
+            # NOTE: Episodes don't have category_id - they inherit from parent series
             active_episode_relations = M3UEpisodeRelation.objects.filter(
                 m3u_account__is_active=True,
-            ).filter(
-                Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
             ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
 
             eps_query = Episode.objects.filter(
-                series_id=s.id,
-                m3u_relations__m3u_account__is_active=True
+                series_id=s.id
             )
 
             # Check for duplicate relations (issue #569 detection)
@@ -1522,6 +1560,20 @@ class Plugin:
             "type": "string",
             "default": "",
             "help": "Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\s*-\s*). Matches are replaced with empty string.",
+        },
+        {
+            "id": "filter_movie_ids",
+            "label": "Content Filter: Movie IDs",
+            "type": "string",
+            "default": "",
+            "help": "Comma-separated database IDs to include (e.g., '11730,14359'). Leave empty to generate all.",
+        },
+        {
+            "id": "filter_series_ids",
+            "label": "Content Filter: Series IDs",
+            "type": "string",
+            "default": "",
+            "help": "Comma-separated database IDs to include (e.g., '1521,1797,2736'). Leave empty to generate all.",
         },
     ]
 
