@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.11
+Version: 0.0.12
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -29,6 +29,7 @@ if str(_plugin_parent) not in sys.path:
     sys.path.insert(0, str(_plugin_parent))
 
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any
+from xml.sax.saxutils import escape as xml_escape
 
 from django.db import connection, transaction
 from django.db.models import Count, Exists, OuterRef, Prefetch, Q
@@ -240,34 +242,6 @@ def _get_episode_stream_id(episode: Episode) -> str | None:
         return None
 
 
-def _get_stream_id_from_prefetch(instance, relation_attr: str = 'active_relation') -> str | None:
-    """
-    Extract stream_id from prefetched relation on a Movie or Episode instance.
-
-    Expects the instance to have a prefetched attribute containing the highest
-    priority active M3U relation. This avoids N+1 queries.
-
-    Args:
-        instance: Movie or Episode instance with prefetched relation
-        relation_attr: Name of the prefetched attribute (default: 'active_relation')
-
-    Returns:
-        stream_id or None if no relation found
-    """
-    try:
-        # Access prefetched relation - this doesn't trigger a DB query
-        relations = getattr(instance, relation_attr, [])
-        if relations:
-            # Prefetch should order by priority, so first item is highest priority
-            relation = relations[0]
-            return getattr(relation, 'stream_id', None)
-    except (AttributeError, IndexError, TypeError) as e:
-        LOGGER.debug("Failed to get stream_id from prefetch: %s", e)
-        return None
-    else:
-        return None
-
-
 def _get_relation_from_prefetch(instance, relation_attr: str = 'active_relation'):
     """
     Get the prefetched relation object from a Movie or Episode instance.
@@ -332,12 +306,20 @@ def _load_manifest(root: Path) -> Dict[str, Any]:
     Manifest tracks written files to avoid unnecessary disk writes.
     Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode", "url": "..."}}, "version": 1}
     Note: Including "url" field allows detection of URL changes (e.g., when stream_id parameter is added).
+
+    Uses file-level locking (flock) to prevent concurrent jobs from corrupting manifest.
     """
     manifest_path = root / ".vod2strm_manifest.json"
     try:
         if manifest_path.exists():
             with manifest_path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                # Acquire shared lock for reading (multiple readers allowed)
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                return data
     except Exception as e:
         LOGGER.warning("Failed to load manifest from %s: %s", manifest_path, e)
     return {"files": {}, "version": 1}
@@ -347,14 +329,29 @@ def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
     """
     Save manifest file atomically using temp file + rename.
     Minimizes risk of corruption if interrupted.
+
+    Uses file-level locking (flock) to prevent concurrent jobs from corrupting manifest.
+    Exclusive lock prevents other processes from reading/writing during save.
     """
     manifest_path = root / ".vod2strm_manifest.json"
     try:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = manifest_path.with_suffix(f".tmp.{int(time.time() * 1000)}")
+
+        # Write to temp file first (atomic write pattern)
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, sort_keys=True)
-        tmp_path.replace(manifest_path)
+
+        # Acquire exclusive lock before replacing manifest file
+        # Create lock file to coordinate with other processes
+        lock_path = manifest_path.with_suffix(".lock")
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                tmp_path.replace(manifest_path)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     except Exception as e:
         LOGGER.warning("Failed to save manifest to %s: %s", manifest_path, e)
 
@@ -582,15 +579,15 @@ def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, 
 
 
 def _xml_escape(text: str | None) -> str:
+    """
+    Escape text for XML using standard library function.
+    Uses xml.sax.saxutils.escape for robustness against edge cases.
+    """
     if not text:
         return ""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
+    # xml_escape handles &, <, > by default
+    # Add quotes for attribute safety
+    return xml_escape(text).replace('"', "&quot;").replace("'", "&apos;")
 
 
 # -------------------- NFO Builders --------------------
@@ -1540,7 +1537,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.11"
+    version = "0.0.12"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1830,10 +1827,13 @@ else:
 
 # -------------------- Auto-run after VOD refresh --------------------
 
-# Debounce state for auto-run
+# Debounce state for auto-run (process-local for timer management)
 _auto_run_debounce_timer = None
 _auto_run_lock = threading.Lock()
-_auto_run_in_progress = False  # Prevents infinite loop when our own runs create episodes
+
+# Cross-process coordination using Django cache
+# Cache key tracks whether auto-run is currently executing across all workers
+AUTO_RUN_CACHE_KEY = "vod2strm_auto_run_in_progress"
 
 
 def _schedule_auto_run_after_vod_refresh():
@@ -1871,13 +1871,22 @@ def _schedule_auto_run_after_vod_refresh():
 
                 Reloads settings from database to avoid using stale settings captured
                 in closure. Re-checks plugin enabled state before executing.
-                Sets _auto_run_in_progress flag to prevent signal handlers from
-                triggering another auto-run while this one is executing. Flag is
-                cleared in finally block to ensure it's reset even on errors.
+                Uses Django cache for cross-process coordination to prevent multiple
+                workers from running simultaneously. Cache key acts as distributed lock.
                 """
-                global _auto_run_in_progress
+                from django.core.cache import cache
+
                 LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
-                _auto_run_in_progress = True
+
+                # Try to acquire distributed lock using cache (atomic operation)
+                # set with nx=True (only set if not exists) acts as a lock
+                # Timeout of 3600s (1 hour) prevents stuck locks if process crashes
+                lock_acquired = cache.add(AUTO_RUN_CACHE_KEY, "locked", timeout=3600)
+
+                if not lock_acquired:
+                    LOGGER.info("Auto-run already in progress in another worker, skipping")
+                    return
+
                 try:
                     # Reload settings from database (avoid stale settings from closure)
                     from apps.plugins.models import PluginConfig
@@ -1908,8 +1917,9 @@ def _schedule_auto_run_after_vod_refresh():
                         use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
                     )
                 finally:
-                    _auto_run_in_progress = False
-                    LOGGER.debug("Auto-run completed, flag cleared")
+                    # Release distributed lock
+                    cache.delete(AUTO_RUN_CACHE_KEY)
+                    LOGGER.debug("Auto-run completed, lock released")
 
             _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
             _auto_run_debounce_timer.daemon = True
@@ -1932,7 +1942,7 @@ try:
         Django signal handler triggered when Episode model is saved.
 
         Schedules auto-run generation only when NEW episodes are created (not updates).
-        Checks _auto_run_in_progress flag to prevent infinite loops when our own
+        Checks cache-based distributed lock to prevent infinite loops when our own
         _maybe_internal_refresh_series() creates episodes during generation.
 
         Args:
@@ -1941,9 +1951,12 @@ try:
             created: Boolean indicating if this is a new row (True) or update (False)
             **kwargs: Additional signal arguments
         """
+        from django.core.cache import cache
+
         # Don't trigger if we're already running (prevents infinite loop when our own
         # _maybe_internal_refresh_series creates episodes)
-        if created and not _auto_run_in_progress:
+        # Check distributed lock via cache
+        if created and not cache.get(AUTO_RUN_CACHE_KEY):
             _schedule_auto_run_after_vod_refresh()
 
     @receiver(post_save, sender=Movie)
@@ -1952,7 +1965,7 @@ try:
         Django signal handler triggered when Movie model is saved.
 
         Schedules auto-run generation only when NEW movies are created (not updates).
-        Checks _auto_run_in_progress flag to prevent re-triggering during active runs.
+        Checks cache-based distributed lock to prevent re-triggering during active runs.
 
         Args:
             sender: The model class (Movie)
@@ -1960,8 +1973,10 @@ try:
             created: Boolean indicating if this is a new row (True) or update (False)
             **kwargs: Additional signal arguments
         """
+        from django.core.cache import cache
+
         # Don't trigger if we're already running
-        if created and not _auto_run_in_progress:
+        if created and not cache.get(AUTO_RUN_CACHE_KEY):
             _schedule_auto_run_after_vod_refresh()
 
     # Listen for new provider relations (catches "same content, new provider" scenario)
@@ -1975,7 +1990,9 @@ try:
         Schedules auto-run when new provider relations are created. This catches
         the scenario where existing movies get linked to a new/higher priority provider.
         """
-        if created and not _auto_run_in_progress:
+        from django.core.cache import cache
+
+        if created and not cache.get(AUTO_RUN_CACHE_KEY):
             _schedule_auto_run_after_vod_refresh()
 
     @receiver(post_save, sender=M3UEpisodeRelation)
@@ -1986,7 +2003,9 @@ try:
         Schedules auto-run when new provider relations are created. This catches
         the scenario where existing episodes get linked to a new/higher priority provider.
         """
-        if created and not _auto_run_in_progress:
+        from django.core.cache import cache
+
+        if created and not cache.get(AUTO_RUN_CACHE_KEY):
             _schedule_auto_run_after_vod_refresh()
 
     LOGGER.info("VOD refresh signal handlers registered (including provider relation handlers)")
