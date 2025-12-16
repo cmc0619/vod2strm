@@ -2035,80 +2035,94 @@ def _ensure_signals_registered():
     """
     global _SIGNALS_REGISTERED
 
-    if _SIGNALS_REGISTERED:
-        return  # Already registered
+    # Use lock to prevent race conditions during concurrent initialization
+    with _LOG_LOCK:
+        if _SIGNALS_REGISTERED:
+            return  # Already registered
 
-    try:
-        from django.db.models.signals import post_save
-        from django.dispatch import receiver
+        try:
+            from django.db.models.signals import post_save
+            from django.dispatch import receiver
 
-        # Import models to verify DB is ready
-        from apps.vod.models import Episode, Movie
-        from vod.models import M3UMovieRelation, M3UEpisodeRelation
+            # Import models to verify DB is ready
+            try:
+                from apps.vod.models import (
+                    Episode,
+                    Movie,
+                    M3UMovieRelation,
+                    M3UEpisodeRelation,
+                )
+            except ImportError:
+                from vod.models import (
+                    Episode,
+                    Movie,
+                    M3UMovieRelation,
+                    M3UEpisodeRelation,
+                )
 
-        # Define signal handlers
-        @receiver(post_save, sender=Episode)
-        def on_episode_saved(sender, instance, created, **kwargs):
-            """
-            Django signal handler triggered when Episode model is saved.
+            # Define signal handlers
+            @receiver(post_save, sender=Episode)
+            def on_episode_saved(sender, instance, created, **kwargs):
+                """
+                Django signal handler triggered when Episode model is saved.
 
-            Schedules auto-run generation only when NEW episodes are created (not updates).
-            Checks cache-based distributed lock to prevent infinite loops when our own
-            _maybe_internal_refresh_series() creates episodes during generation.
-            """
-            from django.core.cache import cache
+                Schedules auto-run generation only when NEW episodes are created (not updates).
+                Checks cache-based distributed lock to prevent infinite loops when our own
+                _maybe_internal_refresh_series() creates episodes during generation.
+                """
+                from django.core.cache import cache
 
-            # Don't trigger if we're already running (prevents infinite loop)
-            if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                _schedule_auto_run_after_vod_refresh()
+                # Don't trigger if we're already running (prevents infinite loop)
+                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                    _schedule_auto_run_after_vod_refresh()
 
-        @receiver(post_save, sender=Movie)
-        def on_movie_saved(sender, instance, created, **kwargs):
-            """
-            Django signal handler triggered when Movie model is saved.
+            @receiver(post_save, sender=Movie)
+            def on_movie_saved(sender, instance, created, **kwargs):
+                """
+                Django signal handler triggered when Movie model is saved.
 
-            Schedules auto-run generation only when NEW movies are created (not updates).
-            Checks cache-based distributed lock to prevent re-triggering during active runs.
-            """
-            from django.core.cache import cache
+                Schedules auto-run generation only when NEW movies are created (not updates).
+                Checks cache-based distributed lock to prevent re-triggering during active runs.
+                """
+                from django.core.cache import cache
 
-            # Don't trigger if we're already running
-            if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                _schedule_auto_run_after_vod_refresh()
+                # Don't trigger if we're already running
+                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                    _schedule_auto_run_after_vod_refresh()
 
-        @receiver(post_save, sender=M3UMovieRelation)
-        def on_movie_relation_saved(sender, instance, created, **kwargs):
-            """
-            Django signal handler triggered when M3UMovieRelation is saved.
+            @receiver(post_save, sender=M3UMovieRelation)
+            def on_movie_relation_saved(sender, instance, created, **kwargs):
+                """
+                Django signal handler triggered when M3UMovieRelation is saved.
 
-            Schedules auto-run when new provider relations are created. This catches
-            the scenario where existing movies get linked to a new/higher priority provider.
-            """
-            from django.core.cache import cache
+                Schedules auto-run when new provider relations are created. This catches
+                the scenario where existing movies get linked to a new/higher priority provider.
+                """
+                from django.core.cache import cache
 
-            if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                _schedule_auto_run_after_vod_refresh()
+                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                    _schedule_auto_run_after_vod_refresh()
 
-        @receiver(post_save, sender=M3UEpisodeRelation)
-        def on_episode_relation_saved(sender, instance, created, **kwargs):
-            """
-            Django signal handler triggered when M3UEpisodeRelation is saved.
+            @receiver(post_save, sender=M3UEpisodeRelation)
+            def on_episode_relation_saved(sender, instance, created, **kwargs):
+                """
+                Django signal handler triggered when M3UEpisodeRelation is saved.
 
-            Schedules auto-run when new provider relations are created. This catches
-            the scenario where existing episodes get linked to a new/higher priority provider.
-            """
-            from django.core.cache import cache
+                Schedules auto-run when new provider relations are created. This catches
+                the scenario where existing episodes get linked to a new/higher priority provider.
+                """
+                from django.core.cache import cache
 
-            if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                _schedule_auto_run_after_vod_refresh()
+                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                    _schedule_auto_run_after_vod_refresh()
 
-        _SIGNALS_REGISTERED = True
-        LOGGER.info("VOD refresh signal handlers registered successfully (lazy init)")
+            _SIGNALS_REGISTERED = True
+            LOGGER.info("VOD refresh signal handlers registered successfully (lazy init)")
 
-    except ImportError as e:
-        LOGGER.warning("Could not register VOD refresh signal handlers (models not available): %s", e)
-    except Exception as e:
-        LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
+        except ImportError as e:
+            LOGGER.warning("Could not register VOD refresh signal handlers (models not available): %s", e)
+        except Exception as e:
+            LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
 
 
 # ============================================================================
