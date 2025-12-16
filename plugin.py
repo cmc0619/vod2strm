@@ -1028,10 +1028,39 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
             except Exception:
                 pass
 
+        # Clean up tvshow.nfo files in series folders that no longer have any episodes
+        pruned_tvshow_nfos = 0
+        # Track series folders (parent of season folders) from stale episode paths
+        series_folders = set()
+        for p in stale_paths:
+            # Episode paths: root/TV/SeriesName/Season##/episode.strm
+            # Series folder is parent.parent (grandparent of episode.strm)
+            if "TV" in str(p) and len(p.parts) >= 4:
+                # Verify structure: .../TV/SeriesName/Season##/episode.strm
+                series_folder = p.parent.parent  # Skip season folder, get series folder
+                if series_folder.exists() and series_folder != root:
+                    series_folders.add(series_folder)
+
+        # Check each series folder for tvshow.nfo cleanup
+        for series_folder in series_folders:
+            try:
+                tvshow_nfo = series_folder / "tvshow.nfo"
+                # Delete tvshow.nfo if it exists and no .strm files remain in the entire series
+                if tvshow_nfo.exists():
+                    # Check if any .strm files remain anywhere in this series folder tree
+                    if not any(series_folder.rglob("*.strm")):
+                        tvshow_nfo.unlink()
+                        pruned_tvshow_nfos += 1
+                        LOGGER.debug("Deleted orphaned tvshow.nfo: %s", tvshow_nfo)
+            except Exception as e:
+                LOGGER.debug("Failed to check/delete tvshow.nfo in %s: %s", series_folder, e)
+
         if deleted_nfos > 0:
             rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_nfos", str(deleted_nfos)])
         if pruned_season_nfos > 0:
             rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_season_nfos", str(pruned_season_nfos)])
+        if pruned_tvshow_nfos > 0:
+            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_tvshow_nfos", str(pruned_tvshow_nfos)])
         if pruned_dirs > 0:
             rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned_dirs)])
     LOGGER.info("Cleanup finished (apply=%s, deleted_nfos=%d)", apply, deleted_nfos)
