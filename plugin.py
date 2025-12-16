@@ -1416,7 +1416,11 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     # Episodes were fetched, recount (no sleep needed - synchronous call)
                     expected = _series_expected_count(s.id)
                 else:
+                    # Skip immediately to avoid unnecessary database queries for series we know have no episodes
                     LOGGER.debug("Could not fetch episodes for series id=%s; skipping.", s.id)
+                    with lock:
+                        rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "refresh_failed"])
+                    continue
 
             if expected > 0 and _compare_tree_quick(series_folder, expected, write_nfos):
                 with lock:
