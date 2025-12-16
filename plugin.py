@@ -659,6 +659,38 @@ def _nfo_episode(e: Episode, clean_name: str | None = None) -> bytes:
     return xml.getvalue().encode("utf-8")
 
 
+def _nfo_tvshow(s: Series, clean_name: str | None = None) -> bytes:
+    """
+    Generate tvshow.nfo for series root directory.
+    Contains series-level metadata for Kodi/Plex/Jellyfin.
+    """
+    # Use clean_name if provided, otherwise fall back to DB name
+    title = clean_name if clean_name else (s.name or "")
+    fields = {
+        "title": title,
+        "plot": getattr(s, "description", "") or "",
+        "year": str(getattr(s, "year", "") or ""),
+        "rating": str(getattr(s, "rating", "") or ""),
+        "genre": getattr(s, "genre", "") or "",
+        "uniqueid_tmdb": str(getattr(s, "tmdb_id", "") or ""),
+        "uniqueid_imdb": str(getattr(s, "imdb_id", "") or ""),
+    }
+    xml = io.StringIO()
+    xml.write("<tvshow>\n")
+    for tag, val in fields.items():
+        if val:
+            if tag.startswith("uniqueid_"):
+                typ = tag.split("_", 1)[1]
+                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
+            else:
+                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
+    logo = getattr(s, "logo", None)
+    if logo:
+        xml.write(f"  <thumb>{_xml_escape(str(logo))}</thumb>\n")
+    xml.write("</tvshow>\n")
+    return xml.getvalue().encode("utf-8")
+
+
 # -------------------- Filename helpers --------------------
 
 def _episode_filename(e: Episode) -> str:
@@ -689,6 +721,11 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
     if strm_count != expected_count:
         return False
     if want_nfos:
+        # Check for tvshow.nfo in series root
+        tvshow_nfo = series_root / "tvshow.nfo"
+        if not tvshow_nfo.exists():
+            return False
+        # Check episode NFO count
         nfo_eps = len(list(series_root.rglob("S??E??.nfo")))
         if nfo_eps != expected_count:
             return False
@@ -750,7 +787,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", raw_name, movie_year or "", str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -814,6 +851,29 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
+        # tvshow.nfo (only write once per series - in series root directory)
+        should_write_tvshow = False
+
+        if written_tvshows is not None:
+            with lock:
+                if series.id not in written_tvshows:
+                    written_tvshows.add(series.id)
+                    should_write_tvshow = True
+        else:
+            # Fallback if no set provided (shouldn't happen)
+            should_write_tvshow = True
+
+        if should_write_tvshow:
+            tvshow_start = time.time()
+            tvshow_nfo_path = s_folder / "tvshow.nfo"
+            clean_series_name = _clean_name(series.name or "", clean_regex)
+            tvshow_nfo_bytes = _nfo_tvshow(series, clean_name=clean_series_name)
+            wrote_tv, reason_tv = _write_if_changed(tvshow_nfo_path, tvshow_nfo_bytes)
+            if wrote_tv and throttle:
+                throttle.record_write(time.time() - tvshow_start)
+            with lock:
+                report_rows.append(["tvshow_nfo", series.name or "", "", "", getattr(series, "year", ""), str(series.uuid), "", str(tvshow_nfo_path), "written" if wrote_tv else "skipped", reason_tv])
+
         # season.nfo (only write once per season)
         season_key = (series.id, season_number)
         should_write_season = False
@@ -1308,8 +1368,9 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     manifest = _load_manifest(root)
     lock = threading.Lock()
 
-    # Track written seasons to avoid duplicate season.nfo writes
+    # Track written seasons and tvshows to avoid duplicate NFO writes
     written_seasons = set()
+    written_tvshows = set()
 
     throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
@@ -1406,8 +1467,8 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                             write_nfo_for_this = write_nfos and idx == 0
                             
                             _make_episode_strm_and_nfo(
-                                s, e, base_url, root, write_nfo_for_this, rows, lock, manifest, 
-                                relation, dry_run, throttle, written_seasons, clean_regex, use_direct_urls, provider_suffix
+                                s, e, base_url, root, write_nfo_for_this, rows, lock, manifest,
+                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix
                             )
                     except Exception as ep_error:
                         LOGGER.warning("Episode id=%s failed: %s", e.id, ep_error)
