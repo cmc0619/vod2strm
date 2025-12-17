@@ -2187,29 +2187,39 @@ def _ensure_signals_registered():
                     _schedule_auto_run_after_vod_refresh()
 
             @receiver(post_save, sender=M3UMovieRelation)
-            def on_movie_relation_saved(sender, instance, created, **kwargs):
+            def on_movie_relation_saved(sender, instance, **kwargs):
                 """
                 Django signal handler triggered when M3UMovieRelation is saved.
 
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing movies get linked to a new/higher priority provider.
+                Schedules auto-run when provider relations are created OR updated. This catches
+                VOD refreshes that update existing relations (provider priority changes, account
+                changes, etc.) in addition to new content being added.
+
+                Note: Removed 'created' parameter check to catch both creates AND updates,
+                since Dispatcharr VOD refresh often updates existing relations rather than
+                creating new ones.
                 """
                 from django.core.cache import cache
 
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                if not cache.get(AUTO_RUN_CACHE_KEY):
                     _schedule_auto_run_after_vod_refresh()
 
             @receiver(post_save, sender=M3UEpisodeRelation)
-            def on_episode_relation_saved(sender, instance, created, **kwargs):
+            def on_episode_relation_saved(sender, instance, **kwargs):
                 """
                 Django signal handler triggered when M3UEpisodeRelation is saved.
 
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing episodes get linked to a new/higher priority provider.
+                Schedules auto-run when provider relations are created OR updated. This catches
+                VOD refreshes that update existing relations (provider priority changes, account
+                changes, etc.) in addition to new content being added.
+
+                Note: Removed 'created' parameter check to catch both creates AND updates,
+                since Dispatcharr VOD refresh often updates existing relations rather than
+                creating new ones.
                 """
                 from django.core.cache import cache
 
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
+                if not cache.get(AUTO_RUN_CACHE_KEY):
                     _schedule_auto_run_after_vod_refresh()
 
             _SIGNALS_REGISTERED = True
