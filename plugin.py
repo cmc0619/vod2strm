@@ -2115,17 +2115,19 @@ def _schedule_auto_run_after_vod_refresh():
 
 def _ensure_signals_registered():
     """
-    Lazily register Django signal handlers when first needed (after DB is ready).
+    Register Django signal handlers for auto-run on VOD refresh.
 
-    IMPORTANT: Dispatcharr changed plugin loading in commit 1200d7d (Sept 2025).
-    Plugins now load in two phases:
+    This function is called both at module load time (with retry) and from
+    Plugin.run() (as a safety fallback). Uses a global flag to prevent
+    duplicate registration.
+
+    Background: Dispatcharr commit 1200d7d (Sept 2025) changed plugin loading
+    to happen in two phases:
       1. discover_plugins(sync_db=False) - before DB/migrations ready
       2. discover_plugins(sync_db=True) - after migrations complete
 
-    Module-level code executes during phase 1 (DB not ready), but Python's
-    module caching prevents it from running again in phase 2. This function
-    provides lazy initialization that runs when Plugin.run() is first called,
-    ensuring signals register after the database is fully ready.
+    Module-level code executes during phase 1, so we use a retry mechanism
+    to handle the database readiness timing issue.
     """
     global _SIGNALS_REGISTERED
 
@@ -2211,12 +2213,58 @@ def _ensure_signals_registered():
                     _schedule_auto_run_after_vod_refresh()
 
             _SIGNALS_REGISTERED = True
-            LOGGER.info("VOD refresh signal handlers registered successfully (lazy init)")
+            LOGGER.info("VOD refresh signal handlers registered successfully")
 
         except ImportError as e:
-            LOGGER.warning("Could not register VOD refresh signal handlers (models not available): %s", e)
+            LOGGER.debug("Signal registration deferred (models not available): %s", e)
+            raise  # Re-raise to trigger retry mechanism
         except Exception as e:
             LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
+            raise  # Re-raise to trigger retry mechanism
+
+
+def _register_signals_with_retry():
+    """
+    Attempt to register signals at module load time with background retry.
+
+    If registration fails (database not ready), spawns a background thread
+    that retries every 3 seconds for up to 30 seconds. This ensures signals
+    are registered automatically when Dispatcharr starts, without requiring
+    user interaction (clicking a button).
+    """
+    try:
+        _ensure_signals_registered()
+    except Exception as e:
+        # DB not ready yet - retry in background
+        LOGGER.debug("Signal registration deferred (DB not ready): %s", e)
+
+        def retry_registration():
+            """Background thread that retries signal registration."""
+            import time
+            for attempt in range(10):  # Try for ~30 seconds
+                time.sleep(3)
+                try:
+                    _ensure_signals_registered()
+                    LOGGER.info("VOD refresh signal handlers registered after %d retries", attempt + 1)
+                    break
+                except Exception:
+                    if attempt == 9:  # Last attempt
+                        LOGGER.warning("Failed to register VOD refresh signals after 10 attempts. "
+                                     "Auto-run may not work until plugin is used manually.")
+
+        # Start retry thread (daemon=True so it doesn't prevent shutdown)
+        retry_thread = threading.Thread(target=retry_registration, daemon=True, name="vod2strm-signal-retry")
+        retry_thread.start()
+
+
+# ============================================================================
+# MODULE-LEVEL SIGNAL REGISTRATION
+# ============================================================================
+# Register signals immediately when module loads, with retry mechanism to
+# handle database readiness timing. This ensures auto-run works from the
+# moment Dispatcharr starts, without requiring user interaction.
+# ============================================================================
+_register_signals_with_retry()
 
 
 # ============================================================================
