@@ -788,26 +788,6 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
 
 
 def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
-    # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
-    # Episodes can disappear mid-generation due to sync conflicts
-    try:
-        episode_exists = Episode.objects.filter(id=episode.id).exists()
-        if not episode_exists:
-            title = getattr(episode, "name", "") or ""
-            season_number = getattr(episode, "season_number", 0) or 0
-            LOGGER.warning(
-                "Dispatcharr issue #556: Episode id=%s (S%02dE%02d - %s) vanished from database during generation. Skipping.",
-                episode.id,
-                season_number,
-                getattr(episode, "episode_number", 0) or 0,
-                title
-            )
-            with lock:
-                report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", "", "skipped", "episode_vanished"])
-            return
-    except Exception as validation_error:
-        LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
-
     s_folder = root / "TV" / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None))
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
@@ -1209,72 +1189,6 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
         LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
 
 
-def _cleanup_series_episodes(series_id: int) -> bool:
-    """
-    Targeted cleanup for a single series - deletes episodes and resets cache flags.
-
-    This is called when Dispatcharr issue #556 duplicate key error occurs during
-    series refresh. Instead of leaving corrupted data, we clean the series and
-    allow a retry.
-
-    Args:
-        series_id: The series ID to clean up
-
-    Returns:
-        True if cleanup succeeded, False otherwise
-    """
-    try:
-        with transaction.atomic():
-            # Count what will be deleted
-            episode_count = Episode.objects.filter(series_id=series_id).count()
-
-            if episode_count > 0:
-                # Delete episodes for this series (cascade handles M3UEpisodeRelation)
-                deleted_count, _ = Episode.objects.filter(series_id=series_id).delete()
-                LOGGER.info(
-                    "Cleaned up series_id=%s: deleted %d objects (%d episodes)",
-                    series_id,
-                    deleted_count,
-                    episode_count
-                )
-
-            # Reset cache flags for this series' relations
-            # NOTE: Using raw SQL instead of ORM because:
-            # 1. custom_properties is PostgreSQL JSONB - need to update nested keys without replacing entire object
-            # 2. ORM would require N queries (fetch, modify, save for each relation) = slow + not atomic
-            # 3. PostgreSQL's jsonb_set() does atomic partial updates in a single query
-            # 4. Django ORM lacks native JSONB merge/partial update support
-            relation_count = M3USeriesRelation.objects.filter(series_id=series_id).count()
-            if relation_count > 0:
-                with connection.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE vod_m3useriesrelation
-                        SET custom_properties = jsonb_set(
-                                jsonb_set(
-                                    COALESCE(custom_properties, '{}'::jsonb),
-                                    '{episodes_fetched}', 'false'::jsonb,
-                                    true
-                                ),
-                                '{detailed_fetched}', 'false'::jsonb,
-                                true
-                            ),
-                            last_episode_refresh = NULL
-                        WHERE series_id = %s
-                    """, [series_id])
-                    reset_count = cursor.rowcount
-                    LOGGER.info(
-                        "Reset %d cache flags for series_id=%s",
-                        reset_count,
-                        series_id
-                    )
-
-        return True
-
-    except Exception:
-        LOGGER.exception("Failed to clean up series_id=%s", series_id)
-        return False
-
-
 def _maybe_internal_refresh_series(series: Series) -> bool:
     """
     Refresh episodes from the highest priority provider only.
@@ -1322,43 +1236,13 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
                 relation.external_series_id
             )
         except Exception as refresh_error:
-            # Check if this is the duplicate key constraint error from issue #556
-            error_str = str(refresh_error)
-            if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
-                LOGGER.warning(
-                    "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
-                    "Attempting targeted cleanup and retry...",
-                    series.id
-                )
-                # Clean up corrupted episodes and cache flags for this series
-                if _cleanup_series_episodes(series.id):
-                    LOGGER.info("Cleanup succeeded, retrying refresh for series_id=%s", series.id)
-                    try:
-                        # Retry the refresh once after cleanup
-                        refresh_series_episodes(
-                            relation.m3u_account,
-                            series,
-                            relation.external_series_id
-                        )
-                        LOGGER.info("Retry succeeded for series_id=%s after cleanup", series.id)
-                    except Exception as retry_error:
-                        LOGGER.error(
-                            "Retry failed for series_id=%s after cleanup: %s",
-                            series.id,
-                            retry_error
-                        )
-                        return False
-                else:
-                    LOGGER.error("Cleanup failed for series_id=%s, giving up", series.id)
-                    return False
-            else:
-                LOGGER.warning(
-                    "Episode refresh error for series_id=%s from provider %s: %s",
-                    series.id,
-                    relation.m3u_account.name,
-                    refresh_error
-                )
-                return False
+            LOGGER.warning(
+                "Episode refresh error for series_id=%s from provider %s: %s",
+                series.id,
+                relation.m3u_account.name,
+                refresh_error
+            )
+            return False
 
         # Check if we got episodes
         episode_count = Episode.objects.filter(series_id=series.id).count()
@@ -1613,72 +1497,6 @@ def _db_stats() -> str:
     return "\n".join(stats)
 
 
-def _db_cleanup() -> str:
-    """
-    Database cleanup - deletes ALL episodes and episode relations, then resets series cache flags.
-    Issue #556 - Quick database cleanup for development/debugging.
-
-    Replicates these operations:
-        1. DELETE FROM vod_episode (cascades to vod_m3uepisoderelation)
-        2. RESET series cache flags (episodes_fetched, detailed_fetched, last_episode_refresh)
-
-        This ensures Dispatcharr will re-fetch episodes on next UI interaction.
-
-    Returns:
-        Formatted string with operation results
-    """
-    results = []
-    results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
-
-    try:
-        # Count what will be deleted/reset
-        episode_count = Episode.objects.count()
-        series_relation_count = M3USeriesRelation.objects.count()
-
-        results.append(f"Episodes to delete: {episode_count}")
-        results.append(f"Series relations to reset: {series_relation_count}")
-
-        if episode_count > 0 or series_relation_count > 0:
-            with transaction.atomic():
-                # Delete all episodes (cascade deletes will handle M3UEpisodeRelation automatically)
-                if episode_count > 0:
-                    deleted_count, details = Episode.objects.all().delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-
-                # Reset series cache flags so Dispatcharr re-fetches episodes on next UI interaction
-                if series_relation_count > 0:
-                    with connection.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE vod_m3useriesrelation
-                            SET custom_properties = jsonb_set(
-                                    jsonb_set(
-                                        COALESCE(custom_properties, '{}'::jsonb),
-                                        '{episodes_fetched}', 'false'::jsonb,
-                                        true
-                                    ),
-                                    '{detailed_fetched}', 'false'::jsonb,
-                                    true
-                                ),
-                                last_episode_refresh = NULL
-                        """)
-                        reset_count = cursor.rowcount
-                    results.append(f"\n✓ Reset {reset_count} series relation cache flags")
-        else:
-            results.append("\nNothing to delete or reset.")
-
-        results.append("\n✓ Cleanup complete. Dispatcharr will re-fetch episodes on next series view.")
-        LOGGER.info("Database cleanup completed successfully")
-
-    except Exception as e:
-        LOGGER.exception("Database cleanup failed")
-        results.append(f"\nERROR: {e}")
-
-    return "\n".join(results)
-
-
 def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
     movies = _eligible_movie_queryset().count()
     series_qs = _eligible_series_queryset()
@@ -1816,7 +1634,6 @@ class Plugin:
         {"id": "generate_movies", "label": "Generate Movies"},
         {"id": "generate_series", "label": "Generate Series"},
         {"id": "generate_all", "label": "Generate All"},
-        {"id": "db_cleanup", "label": "🗑️ Delete ALL Episodes"},
     ]
 
     def run(self, action_id, params, context):
@@ -1863,15 +1680,6 @@ class Plugin:
             except Exception as e:
                 LOGGER.exception("Database statistics failed")
                 return {"status": "error", "message": f"Failed to generate stats: {e}"}
-
-        # Database cleanup (Issue #556) - delete all episodes and episode relations
-        if action == "db_cleanup":
-            try:
-                result_text = _db_cleanup()
-                return {"status": "ok", "message": result_text}
-            except Exception as e:
-                LOGGER.exception("Database cleanup failed")
-                return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
             self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)

@@ -178,26 +178,17 @@ def _eligible_movie_queryset(filter_movie_ids_str: Optional[str] = None):
 
 ---
 
-### 🟡 7. Per-Episode Validation Query - `plugin.py:794-795`
+### ~~🟡 7. Per-Episode Validation Query~~ ✅ REMOVED
 
-**Location:** `_make_episode_strm_and_nfo()`
+**Status:** Issue #556 workaround code has been removed as the underlying Dispatcharr bug is now fixed.
 
-**Problem:**
-```python
-# Workaround for Dispatcharr bug #556
-episode_exists = Episode.objects.filter(id=episode.id).exists()
-```
+**Removed code:**
+- Episode validation query in `_make_episode_strm_and_nfo()`
+- `_cleanup_series_episodes()` function
+- Duplicate key error handling in `_maybe_internal_refresh_series()`
+- `_db_cleanup()` function and "Delete ALL Episodes" button
 
-**Impact:** One `EXISTS()` query **per episode**. For 100K episodes = **100K queries**.
-
-**Why it exists:** Episodes can disappear mid-generation due to sync conflicts (Dispatcharr bug #556).
-
-**Solution:** Batch validation every N episodes:
-```python
-# Validate in batches of 100
-episode_ids_to_check = [batch of 100 episode IDs]
-valid_ids = set(Episode.objects.filter(id__in=episode_ids_to_check).values_list('id', flat=True))
-```
+**Performance improvement:** Eliminated 100K+ queries for large episode libraries.
 
 ---
 
@@ -327,14 +318,13 @@ The codebase demonstrates several **excellent** performance patterns:
 
 ### Medium-Term (Future Release)
 
-4. **Batch episode validation** (#7) - Reduce queries from 100K → 1K
-5. **Stream file stats** (#5, #8) - Use generators instead of `list()`
-6. **Chunk cleanup operations** (#2) - Process files in batches
+4. **Stream file stats** (#5, #8) - Use generators instead of `list()`
+5. **Chunk cleanup operations** (#2) - Process files in batches
 
 ### Low Priority (Nice to Have)
 
-7. **Cache settings** (#6) - Avoid redundant PluginConfig queries
-8. **Return episode count from refresh** (#9) - Eliminate redundant COUNT
+6. **Cache settings** (#6) - Avoid redundant PluginConfig queries
+7. **Return episode count from refresh** (#9) - Eliminate redundant COUNT
 
 ---
 
@@ -383,6 +373,6 @@ The vod2strm plugin demonstrates **strong performance fundamentals** (prefetchin
 **Quick wins:**
 - Fix series refresh N+1 (#1) → **~10X speedup** for series with 0 episodes
 - Conditional duplicate detection (#4) → **50% fewer queries** during series generation
-- Batch episode validation (#7) → **~100X reduction** in validation queries
+- ~~Batch episode validation (#7)~~ → ✅ **ALREADY DONE** - Removed issue #556 workaround code, eliminated 100K+ queries
 
-**Estimated improvement:** After implementing the top 3 fixes, expect **2-5X performance improvement** for large series libraries (10K+ series).
+**Estimated improvement:** After implementing the top 2 remaining fixes, expect **2-5X performance improvement** for large series libraries (10K+ series).
