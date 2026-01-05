@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.13
+Version: 0.0.13b
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
