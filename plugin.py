@@ -1,2266 +1,899 @@
+#!/usr/bin/env python3
 """
-vod2strm – Dispatcharr Plugin
-Version: 0.0.13
+VOD STRM Plugin for Dispatcharr
+Generates .strm and .nfo files for VOD content with automatic post-refresh triggering.
 
-Spec:
-- ORM (in-process) with Celery background tasks (non-blocking UI).
-- Buttons: Stats, Generate Movies, Generate Series, Generate All.
-- STRM generation:
-  * Movies -> <root>/Movies/{Name} ({Year})/{Name} ({Year}).strm
-  * Series -> <root>/TV/{SeriesName (Year) or SeriesName + (year)}/Season {SS or 00}/S{SS}E{EE} - {Title}.strm
-  * Season 00 labeled "Season 00 (Specials)".
-  * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
-- NFO generation (compare-before-write):
-  * Movies: movie.nfo in movie folder
-  * Seasons: season.nfo per season folder
-  * Episodes: SxxExx.nfo next to episode file
-- Cleanup (preview/apply) of stale files/folders.
-- CSV reports -> /data/plugins/vod2strm/reports/
-- Robust debug logging -> /data/plugins/vod2strm/logs/
+Key features:
+- Generates .strm files pointing to Dispatcharr's proxy URLs for movies and series episodes
+- Generates .nfo metadata files with TMDB/IMDB IDs, plots, ratings, posters
+- Pre-populates episode data using Dispatcharr's refresh_series_episodes task
+- Series-by-series processing: populate episodes → write files → next series
+- Smart file management: only writes when content changes
+- Auto-monitor: watches for VOD refresh completion and auto-generates files
+- Direct Django ORM access (no raw SQL, no external DB credentials)
 """
 
-from __future__ import annotations
-
-# Ensure plugin directory is in sys.path so Celery workers can import this module
-import sys
-from pathlib import Path
-_plugin_parent = Path(__file__).parent.parent
-if str(_plugin_parent) not in sys.path:
-    sys.path.insert(0, str(_plugin_parent))
-
-import csv
-import fcntl
-import hashlib
-import io
 import json
 import logging
-import logging.handlers
-import math
 import os
-try:
-    import regex as re  # Use regex library for better Unicode support (aligns with Dispatcharr)
-except ImportError:
-    import re  # Fallback to standard library if regex not available
+import re
+import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Tuple, Dict, Any, Optional
-from xml.sax.saxutils import escape as xml_escape
+from typing import Any, Dict, List, Optional, Tuple
 
-from django.db import connection, transaction
-from django.db.models import Count, Exists, OuterRef, Prefetch, Q
-from django.utils.timezone import now  # noqa:F401
+import requests
+from django.db import connection
+from django.utils import timezone
 
-# ORM models (plugin runs in-process with the app)
-try:
-    from apps.vod.models import (
-        Movie,
-        Series,
-        Episode,
-        M3UMovieRelation,
-        M3UEpisodeRelation,
-        M3USeriesRelation,
-        M3UVODCategoryRelation,
-    )
-except Exception:  # pragma: no cover
-    from vod.models import (  # type: ignore
-        Movie,
-        Series,
-        Episode,
-        M3UMovieRelation,
-        M3UEpisodeRelation,
-        M3USeriesRelation,
-        M3UVODCategoryRelation,
-    )
+# Import Django models - all VOD and relation models are in apps.vod.models
+from apps.vod.models import (
+    Movie, Series, Episode,
+    M3UMovieRelation, M3USeriesRelation, M3UEpisodeRelation,
+)
+from apps.m3u.models import M3UAccount
 
-# Celery (required - Dispatcharr depends on Celery to function)
-# Import is in try/except for testing purposes only
-try:
-    from celery import current_app as celery_app
-    from celery import shared_task
-except Exception:  # pragma: no cover
-    celery_app = None  # type: ignore
-    shared_task = None  # type: ignore
 
-# -------------------- Constants / Defaults --------------------
+# ---------------------------------------------------------------------------
+# Module-level monitor thread reference so it survives across run() calls
+# ---------------------------------------------------------------------------
+_monitor_thread: Optional[threading.Thread] = None
+_monitor_stop_event = threading.Event()
 
-DEFAULT_BASE_URL = "http://localhost:9191"
-DEFAULT_ROOT = "/data/STRM"
-
-REPORT_ROOT = "/data/plugins/vod2strm/reports"
-LOG_ROOT = "/data/plugins/vod2strm/logs"
-
-CLEANUP_OFF = "off"
-CLEANUP_PREVIEW = "preview"
-CLEANUP_APPLY = "apply"
-
-# -------------------- Logging --------------------
-
-LOGGER = logging.getLogger("plugins.vod2strm")
-if not LOGGER.handlers:
-    LOGGER.setLevel(logging.INFO)
-    sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
-    LOGGER.addHandler(sh)
-
-_FILE_LOGGER_CONFIGURED = False
-_LOG_LOCK = threading.Lock()
-_MANIFEST_LOCK = threading.Lock()  # Protects manifest dict from concurrent modification
-_SIGNALS_REGISTERED = False  # Track if signals have been registered (lazy init)
-
-
-# -------------------- Query Helpers --------------------
-
-def _enabled_category_subquery(account_field: str, category_field: str) -> Exists:
-    """
-    Build an Exists() subquery that ensures a given account/category pair is enabled.
-    account_field/category_field refer to columns available on the outer queryset.
-    """
-    return Exists(
-        M3UVODCategoryRelation.objects.filter(
-            m3u_account_id=OuterRef(account_field),
-            category_id=OuterRef(category_field),
-            enabled=True,
-        )
-    )
-
-
-def _eligible_movie_queryset():
-    """
-    Movies with active account relations AND optional content filter.
-
-    Content filter: Comma-separated database IDs from plugin settings.
-    When filter is empty, all eligible movies are included.
-    """
-    allowed_relations = M3UMovieRelation.objects.filter(
-        movie_id=OuterRef("pk"),
-        m3u_account__is_active=True,
-    ).filter(
-        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    )
-    base_qs = Movie.objects.annotate(_vod2_allowed_movie=Exists(allowed_relations)).filter(_vod2_allowed_movie=True)
-
-    # Load content filter settings from plugin config
-    try:
-        from apps.plugins.models import PluginConfig
-        config = PluginConfig.objects.filter(key="vod2strm").first()
-        settings = config.settings if config else {}
-        filter_movie_ids_str = settings.get("filter_movie_ids", "").strip()
-    except Exception:
-        filter_movie_ids_str = ""
-
-    # Parse UI IDs
-    if filter_movie_ids_str:
-        ui_ids = [int(x.strip()) for x in filter_movie_ids_str.split(',') if x.strip().isdigit()]
-        if ui_ids:
-            base_qs = base_qs.filter(id__in=ui_ids)
-
-    return base_qs
-
-
-def _eligible_series_queryset():
-    """
-    Series with active account relations AND optional content filter.
-
-    Content filter: Comma-separated database IDs from plugin settings.
-    When filter is empty, all eligible series are included.
-    """
-    allowed_relations = M3USeriesRelation.objects.filter(
-        series_id=OuterRef("pk"),
-        m3u_account__is_active=True,
-    ).filter(
-        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    )
-    base_qs = Series.objects.annotate(_vod2_allowed_series=Exists(allowed_relations)).filter(_vod2_allowed_series=True)
-
-    # Load content filter settings from plugin config
-    try:
-        from apps.plugins.models import PluginConfig
-        config = PluginConfig.objects.filter(key="vod2strm").first()
-        settings = config.settings if config else {}
-        filter_series_ids_str = settings.get("filter_series_ids", "").strip()
-    except Exception:
-        filter_series_ids_str = ""
-
-    # Parse UI IDs
-    if filter_series_ids_str:
-        ui_ids = [int(x.strip()) for x in filter_series_ids_str.split(',') if x.strip().isdigit()]
-        if ui_ids:
-            base_qs = base_qs.filter(id__in=ui_ids)
-
-    return base_qs
-
-
-def _get_movie_stream_id(movie: Movie) -> str | None:
-    """
-    Get stream_id from the highest priority active M3U provider for a movie.
-
-    Returns stream_id or None if no active provider found.
-    """
-    try:
-        # Get highest priority active relation
-        relation = M3UMovieRelation.objects.filter(
-            movie_id=movie.id,
-            m3u_account__is_active=True,
-        ).filter(
-            Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-        ).select_related('m3u_account').order_by(
-            '-m3u_account__priority', 'id'
-        ).first()
-
-        if relation:
-            return getattr(relation, 'stream_id', None)
-        return None
-    except Exception as e:
-        LOGGER.debug("Failed to get stream_id for movie id=%s: %s", movie.id, e)
-        return None
-
-
-def _get_episode_stream_id(episode: Episode) -> str | None:
-    """
-    Get stream_id from the highest priority active M3U provider for an episode.
-
-    Returns stream_id or None if no active provider found.
-    """
-    try:
-        # Get highest priority active relation
-        # NOTE: M3UEpisodeRelation has no category_id field (unlike M3UMovieRelation/M3USeriesRelation)
-        # Episodes inherit category from parent series, so we don't filter by category here
-        relation = M3UEpisodeRelation.objects.filter(
-            episode_id=episode.id,
-            m3u_account__is_active=True,
-        ).select_related('m3u_account').order_by(
-            '-m3u_account__priority', 'id'
-        ).first()
-
-        if relation:
-            return getattr(relation, 'stream_id', None)
-        return None
-    except Exception as e:
-        LOGGER.debug("Failed to get stream_id for episode id=%s: %s", episode.id, e)
-        return None
-
-
-def _get_relation_from_prefetch(instance, relation_attr: str = 'active_relation'):
-    """
-    Get the prefetched relation object from a Movie or Episode instance.
-
-    Expects the instance to have a prefetched attribute containing the highest
-    priority active M3U relation. This avoids N+1 queries.
-
-    Args:
-        instance: Movie or Episode instance with prefetched relation
-        relation_attr: Name of the prefetched attribute (default: 'active_relation')
-
-    Returns:
-        M3UMovieRelation or M3UEpisodeRelation object, or None if not found
-    """
-    try:
-        relations = getattr(instance, relation_attr, [])
-        if relations:
-            return relations[0]
-    except (AttributeError, IndexError, TypeError) as e:
-        LOGGER.debug("Failed to get relation from prefetch: %s", e)
-        return None
-    return None
-
-
-def _ensure_dirs() -> None:
-    Path(REPORT_ROOT).mkdir(parents=True, exist_ok=True)
-    Path(LOG_ROOT).mkdir(parents=True, exist_ok=True)
-
-
-def _configure_file_logger(debug_enabled: bool) -> None:
-    global _FILE_LOGGER_CONFIGURED
-    with _LOG_LOCK:
-        if _FILE_LOGGER_CONFIGURED:
-            return
-        _ensure_dirs()
-        level = logging.DEBUG if debug_enabled else logging.INFO
-        LOGGER.setLevel(level)
-        try:
-            fh = logging.handlers.RotatingFileHandler(
-                filename=str(Path(LOG_ROOT) / "vod2strm.log"),
-                maxBytes=10 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            fmt = logging.Formatter(
-                "%(asctime)s %(levelname)s %(name)s %(threadName)s %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-            fh.setFormatter(fmt)
-            fh.setLevel(level)
-            LOGGER.addHandler(fh)
-        except Exception as e:  # pragma: no cover
-            LOGGER.warning("Failed to attach file logger: %s", e)
-        _FILE_LOGGER_CONFIGURED = True
-
-
-# -------------------- Manifest (Metadata Cache) --------------------
-
-def _load_manifest(root: Path) -> Dict[str, Any]:
-    """
-    Load manifest file or return default.
-    Manifest tracks written files to avoid unnecessary disk writes.
-    Structure: {"files": {"/path/to/file.strm": {"uuid": "...", "type": "movie|episode", "url": "..."}}, "version": 1}
-    Note: Including "url" field allows detection of URL changes (e.g., when stream_id parameter is added).
-
-    Uses file-level locking (flock) to prevent concurrent jobs from corrupting manifest.
-    """
-    manifest_path = root / ".vod2strm_manifest.json"
-    try:
-        if manifest_path.exists():
-            with manifest_path.open("r", encoding="utf-8") as f:
-                # Acquire shared lock for reading (multiple readers allowed)
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                try:
-                    data = json.load(f)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                return data
-    except Exception as e:
-        LOGGER.warning("Failed to load manifest from %s: %s", manifest_path, e)
-    return {"files": {}, "version": 1}
-
-
-def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
-    """
-    Save manifest file atomically using temp file + rename.
-    Minimizes risk of corruption if interrupted.
-
-    Uses file-level locking (flock) to prevent concurrent jobs from corrupting manifest.
-    Exclusive lock prevents other processes from reading/writing during save.
-    """
-    manifest_path = root / ".vod2strm_manifest.json"
-    try:
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = manifest_path.with_suffix(f".tmp.{int(time.time() * 1000)}")
-
-        # Write to temp file first (atomic write pattern)
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, sort_keys=True)
-
-        # Acquire exclusive lock before replacing manifest file
-        # Create lock file to coordinate with other processes
-        lock_path = manifest_path.with_suffix(".lock")
-        with lock_path.open("a", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                tmp_path.replace(manifest_path)
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-    except Exception as e:
-        LOGGER.warning("Failed to save manifest to %s: %s", manifest_path, e)
-
-
-# -------------------- Adaptive Throttle --------------------
-
-class AdaptiveThrottle:
-    """
-    Monitors write performance and adjusts concurrency dynamically.
-
-    Strategy:
-    - Start conservative with 1 worker, scale up based on performance
-    - Track average write latency over rolling window (20 writes)
-    - If writes are slow (>100ms), cut workers in half
-    - If writes are fast (<30ms), increase workers by 50%
-    - Check every 10 writes for faster response
-    - Bounds: min=1, max=user_setting (capped at 4)
-    """
-
-    def __init__(self, max_workers: int, enabled: bool = True):
-        # Hard cap at 4 to prevent DB connection exhaustion (Django creates 1 conn per thread)
-        # Even though workers do file I/O, accessing model attributes triggers DB connections
-        self.max_workers = min(max_workers, 4)
-        self.enabled = enabled
-        # Start conservative - begin with 1 worker and scale up based on performance
-        self.current_workers = 1 if enabled else self.max_workers
-        self.write_times = []  # Rolling window of last N write times
-        self.window_size = 20  # Track last 20 writes (smaller window for faster response)
-        self.lock = threading.Lock()
-
-        # Thresholds (in seconds) - more aggressive to protect NAS
-        self.slow_threshold = 0.100  # 100ms (down from 200ms)
-        self.fast_threshold = 0.030  # 30ms (down from 50ms)
-
-        # Adjustment rates
-        self.scale_down_factor = 0.5   # Cut in half when slow (more aggressive)
-        self.scale_up_factor = 1.5     # Increase by 50% when fast (scale up faster)
-
-        # Check interval - adjust every N writes (smaller for faster response)
-        self.check_interval = 10
-        self.writes_since_check = 0
-
-    def record_write(self, write_time: float) -> None:
-        """Record a write operation's duration."""
-        if not self.enabled:
-            return
-
-        with self.lock:
-            self.write_times.append(write_time)
-            if len(self.write_times) > self.window_size:
-                self.write_times.pop(0)
-
-            self.writes_since_check += 1
-            if self.writes_since_check >= self.check_interval:
-                self._adjust_concurrency()
-                self.writes_since_check = 0
-
-    def _adjust_concurrency(self) -> None:
-        """Adjust concurrency based on average write time."""
-        if not self.write_times:
-            return
-
-        avg_write_time = sum(self.write_times) / len(self.write_times)
-        old_workers = self.current_workers
-
-        if avg_write_time > self.slow_threshold:
-            # NAS is slow, reduce workers
-            self.current_workers = max(1, int(self.current_workers * self.scale_down_factor))
-            LOGGER.info(
-                "Adaptive throttle: NAS slow (avg %.3fs), reducing workers %d → %d",
-                avg_write_time, old_workers, self.current_workers
-            )
-        elif avg_write_time < self.fast_threshold and self.current_workers < self.max_workers:
-            # NAS is fast, increase workers
-            self.current_workers = min(self.max_workers, math.ceil(self.current_workers * self.scale_up_factor))
-            if self.current_workers != old_workers:
-                LOGGER.info(
-                    "Adaptive throttle: NAS fast (avg %.3fs), increasing workers %d → %d",
-                    avg_write_time, old_workers, self.current_workers
-                )
-
-    def get_workers(self) -> int:
-        """Get current worker count."""
-        with self.lock:
-            return self.current_workers if self.enabled else self.max_workers
-
-
-# -------------------- Small helpers --------------------
-
-def _ts() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def _norm_fs_name(s: str) -> str:
-    s = (s or "").strip()
-    s = s.replace("/", "-").replace("\\", "-").replace(":", " -")
-    s = s.replace("?", "").replace("*", "").replace('"', "'")
-    s = s.replace("<", "(").replace(">", ")").replace("|", "-")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s or "Unknown"
-
-
-def _clean_name(name: str, pattern: str | None) -> str:
-    """
-    Clean a name using the provided regex pattern.
-    Used to strip prefixes like "EN - " or "TOP - " from names.
-    """
-    if not name or not pattern:
-        return name
-    try:
-        # Strip the pattern from the name
-        # We use sub() to replace matches with empty string
-        return re.sub(pattern, "", name).strip()
-    except re.error as e:
-        LOGGER.warning("Invalid name cleaning regex '%s': %s", pattern, e)
-        return name
-
-
-def _season_folder_name(season_number: int) -> str:
-    if season_number == 0:
-        return "Season 00 (Specials)"
-    return f"Season {season_number:02d}"
-
-
-def _series_folder_name(name: str, year: int | None) -> str:
-    # Avoid double "(YYYY)" if already present and matches DB year
-    year_suffix = re.search(r"\((\d{4})\)\s*$", name or "")
-    if year and year_suffix and int(year_suffix.group(1)) == int(year):
-        return _norm_fs_name(name)
-    if year:
-        return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name or "Unknown Series")
-
-
-def _movie_folder_name(name: str, year: int | None) -> str:
-    """
-    Generate folder name for movie.
-    Strips any existing (YYYY) pattern from name to avoid duplication when adding year.
-    """
-    if not name:
-        name = "Unknown Movie"
-
-    # Strip trailing (YYYY) pattern if present to avoid duplication
-    # Example: "The Matrix (1999)" -> "The Matrix"
-    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-
-    if year:
-        return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name)
-
-
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-def _read_file_bytes(p: Path) -> bytes | None:
-    try:
-        return p.read_bytes()
-    except FileNotFoundError:
-        return None
-
-
-def _write_if_changed(path: Path, content: bytes) -> Tuple[bool, str]:
-    """
-    Compare-before-write. Returns (written, reason)
-    reason ∈ {"created","updated","same_contents"}
-    """
-    existing = _read_file_bytes(path)
-    new_hash = _hash_bytes(content)
-    if existing is not None and _hash_bytes(existing) == new_hash:
-        return (False, "same_contents")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-    return (True, "created" if existing is None else "updated")
-
-
-def _write_strm_if_changed(path: Path, uuid: str, url: str, manifest: Dict[str, Any], file_type: str, dry_run: bool = False) -> Tuple[bool, str]:
-    """
-    Write .strm file only if UUID, URL, or type changed, or file doesn't exist in manifest.
-    Checks manifest first to avoid disk reads when possible.
-
-    Returns (written, reason)
-    reason ∈ {"created", "updated", "cached_skip", "dry_run"}
-    """
-    path_str = str(path)
-    manifest_files = manifest.get("files", {})
-
-    # Check manifest cache first - avoid disk I/O entirely
-    # Include URL in cache check to detect when stream_id or other URL params change
-    cache_matches = False
-    with _MANIFEST_LOCK:
-        if path_str in manifest_files:
-            cached_entry = manifest_files[path_str]
-            cache_matches = (
-                cached_entry.get("uuid") == uuid and
-                cached_entry.get("type") == file_type and
-                cached_entry.get("url") == url
-            )
-
-    # If cache matches, verify file exists (outside lock to minimize lock time)
-    if cache_matches:
-        if path.exists():
-            return (False, "cached_skip")
-        # Manifest is stale - file was deleted/corrupted
-        LOGGER.warning("Manifest entry for %s is stale (file missing); regenerating.", path_str)
-
-    # UUID, URL, or type changed, or not in manifest
-    if dry_run:
-        # Don't write, but report what would happen
-        with _MANIFEST_LOCK:
-            is_new = path_str not in manifest_files
-        return (False, f"dry_run_{'create' if is_new else 'update'}")
-
-    # Write for real
-    content = (url + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-
-    # Update manifest - include URL so we can detect URL changes on next run
-    with _MANIFEST_LOCK:
-        is_new = path_str not in manifest_files
-        manifest_files[path_str] = {"uuid": uuid, "type": file_type, "url": url}
-
-    return (True, "created" if is_new else "updated")
-
-
-def _xml_escape(text: str | None) -> str:
-    """
-    Escape text for XML using standard library function.
-    Uses xml.sax.saxutils.escape for robustness against edge cases.
-    """
-    if not text:
-        return ""
-    # xml_escape handles &, <, > by default
-    # Add quotes for attribute safety
-    return xml_escape(text).replace('"', "&quot;").replace("'", "&apos;")
-
-
-# -------------------- NFO Builders --------------------
-
-def _nfo_movie(m: Movie, clean_name: str | None = None) -> bytes:
-    # Use name field - title field doesn't exist in Movie model
-    # Use clean_name if provided (for title tag), otherwise fall back to DB name
-    title = clean_name if clean_name else (m.name or "")
-    fields = {
-        "title": title,
-        "plot": getattr(m, "description", "") or "",
-        "year": str(getattr(m, "year", "") or ""),
-        "rating": str(getattr(m, "rating", "") or ""),
-        "genre": getattr(m, "genre", "") or "",
-        "uniqueid_tmdb": str(getattr(m, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(m, "imdb_id", "") or ""),
-    }
-    xml = io.StringIO()
-    xml.write("<movie>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
-    logo = getattr(m, "logo", None)
-    if logo:
-        xml.write(f"  <thumb>{_xml_escape(str(logo))}</thumb>\n")
-    xml.write("</movie>\n")
-    return xml.getvalue().encode("utf-8")
-
-
-def _nfo_season(s: Series, season_number: int, clean_series_name: str | None = None) -> bytes:
-    xml = io.StringIO()
-    xml.write("<season>\n")
-    xml.write(f"  <seasonnumber>{season_number}</seasonnumber>\n")
-    name = clean_series_name if clean_series_name else (s.name or "")
-    year = getattr(s, "year", None)
-    xml.write(f"  <tvshowtitle>{_xml_escape(_series_folder_name(name, year))}</tvshowtitle>\n")
-    xml.write("</season>\n")
-    return xml.getvalue().encode("utf-8")
-
-
-def _nfo_episode(e: Episode, clean_name: str | None = None) -> bytes:
-    # Use clean_name if provided (for title tag), otherwise fall back to DB name
-    title = clean_name if clean_name else (e.name or "")
-    fields = {
-        "title": title,
-        "season": str(getattr(e, "season_number", "") or ""),
-        "episode": str(getattr(e, "episode_number", "") or ""),
-        "aired": str(getattr(e, "air_date", "") or ""),
-        "plot": getattr(e, "description", "") or "",
-        "rating": str(getattr(e, "rating", "") or ""),
-        "uniqueid_tmdb": str(getattr(e, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(e, "imdb_id", "") or ""),
-    }
-    xml = io.StringIO()
-    xml.write("<episodedetails>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
-    xml.write("</episodedetails>\n")
-    return xml.getvalue().encode("utf-8")
-
-
-def _nfo_tvshow(s: Series, clean_name: str | None = None) -> bytes:
-    """
-    Generate tvshow.nfo for series root directory.
-    Contains series-level metadata for Kodi/Plex/Jellyfin.
-    """
-    # Use clean_name if provided, otherwise fall back to DB name
-    title = clean_name if clean_name else (s.name or "")
-    fields = {
-        "title": title,
-        "plot": getattr(s, "description", "") or "",
-        "year": str(getattr(s, "year", "") or ""),
-        "rating": str(getattr(s, "rating", "") or ""),
-        "genre": getattr(s, "genre", "") or "",
-        "uniqueid_tmdb": str(getattr(s, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(s, "imdb_id", "") or ""),
-    }
-    xml = io.StringIO()
-    xml.write("<tvshow>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
-    logo = getattr(s, "logo", None)
-    if logo:
-        xml.write(f"  <thumb>{_xml_escape(str(logo))}</thumb>\n")
-    xml.write("</tvshow>\n")
-    return xml.getvalue().encode("utf-8")
-
-
-# -------------------- Filename helpers --------------------
-
-def _episode_filename(e: Episode) -> str:
-    ss = getattr(e, "season_number", 0) or 0
-    ee = getattr(e, "episode_number", 0) or 0
-    title = _norm_fs_name(getattr(e, "name", "") or "Episode")
-    return f"S{ss:02d}E{ee:02d} - {title}.strm"
-
-
-def _episode_nfo_filename(e: Episode) -> str:
-    ss = getattr(e, "season_number", 0) or 0
-    ee = getattr(e, "episode_number", 0) or 0
-    return f"S{ss:02d}E{ee:02d}.nfo"
-
-
-def _series_expected_count(series_id: int) -> int:
-    return Episode.objects.filter(series_id=series_id).count()
-
-
-def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool) -> bool:
-    """
-    Quick short-circuit: if .strm count matches expected (and NFOs if enabled),
-    assume series is complete (skip expensive per-file checks).
-    """
-    if not series_root.exists():
-        return False
-    strm_count = len(list(series_root.rglob("*.strm")))
-    if strm_count != expected_count:
-        return False
-    if want_nfos:
-        # Check for tvshow.nfo in series root
-        tvshow_nfo = series_root / "tvshow.nfo"
-        if not tvshow_nfo.exists():
-            return False
-        # Check episode NFO count
-        nfo_eps = len(list(series_root.rglob("S??E??.nfo")))
-        if nfo_eps != expected_count:
-            return False
-    return True
-
-
-# -------------------- Generators --------------------
-
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
-    # Use name field - title field doesn't exist in Movie model
-    raw_name = movie.name or ""
-    movie_name = _clean_name(raw_name, clean_regex)
-    movie_year = getattr(movie, "year", None)
-
-    m_folder = root / "Movies" / _movie_folder_name(movie_name, movie_year)
-    
-    # Build .strm filename - add provider suffix for multi-provider mode
-    base_filename = _movie_folder_name(movie_name, movie_year)
-    if provider_suffix:
-        # Add provider suffix: "Movie (2023) - ProviderName.strm"
-        strm_filename = f"{base_filename} - {_norm_fs_name(provider_suffix)}.strm"
-    else:
-        strm_filename = f"{base_filename}.strm"
-    strm_path = m_folder / strm_filename
-
-    # Get stream_id from relation
-    stream_id = getattr(relation, 'stream_id', None) if relation else None
-
-    # Build URL - either direct provider URL or proxy URL
-    if use_direct_urls and relation:
-        url = relation.get_stream_url()
-        if not url:
-            # Fallback to proxy if direct URL not available (non-XC account)
-            url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
-            if stream_id:
-                url = f"{url}?stream_id={stream_id}"
-    else:
-        url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
-        if stream_id:
-            url = f"{url}?stream_id={stream_id}"
-
-    # Time the write operation for adaptive throttling
-    start_time = time.time()
-    wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie", dry_run)
-    if wrote and throttle:
-        throttle.record_write(time.time() - start_time)
-
-    with lock:
-        report_rows.append(["movie", "", "", raw_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
-
-    if write_nfos and not dry_run:
-        nfo_start = time.time()
-        nfo_path = m_folder / "movie.nfo"
-        nfo_bytes = _nfo_movie(movie, clean_name=movie_name)
-        wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
-        if wrote_nfo and throttle:
-            throttle.record_write(time.time() - nfo_start)
-        with lock:
-            report_rows.append(["movie_nfo", "", "", raw_name, movie_year or "", str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
-
-
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
-    # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
-    # Episodes can disappear mid-generation due to sync conflicts
-    try:
-        episode_exists = Episode.objects.filter(id=episode.id).exists()
-        if not episode_exists:
-            title = getattr(episode, "name", "") or ""
-            season_number = getattr(episode, "season_number", 0) or 0
-            LOGGER.warning(
-                "Dispatcharr issue #556: Episode id=%s (S%02dE%02d - %s) vanished from database during generation. Skipping.",
-                episode.id,
-                season_number,
-                getattr(episode, "episode_number", 0) or 0,
-                title
-            )
-            with lock:
-                report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", "", "skipped", "episode_vanished"])
-            return
-    except Exception as validation_error:
-        LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
-
-    s_folder = root / "TV" / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None))
-    season_number = getattr(episode, "season_number", 0) or 0
-    e_folder = s_folder / _season_folder_name(season_number)
-    
-    # Build .strm filename - add provider suffix for multi-provider mode
-    base_strm_name = _episode_filename(episode)
-    if provider_suffix:
-        # Add provider suffix: "S01E01 - Episode Title - ProviderName.strm"
-        # Extract extension from base filename
-        base_name_without_ext = base_strm_name.rsplit('.', 1)[0] if '.' in base_strm_name else base_strm_name
-        ext = base_strm_name.rsplit('.', 1)[1] if '.' in base_strm_name else 'strm'
-        strm_name = f"{base_name_without_ext} - {_norm_fs_name(provider_suffix)}.{ext}"
-    else:
-        strm_name = base_strm_name
-    strm_path = e_folder / strm_name
-
-    # Get stream_id from relation
-    stream_id = getattr(relation, 'stream_id', None) if relation else None
-
-    # Build URL - either direct provider URL or proxy URL
-    if use_direct_urls and relation:
-        url = relation.get_stream_url()
-        if not url:
-            # Fallback to proxy if direct URL not available (non-XC account)
-            url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
-            if stream_id:
-                url = f"{url}?stream_id={stream_id}"
-    else:
-        url = f"{base_url.rstrip('/')}/proxy/vod/episode/{episode.uuid}"
-        if stream_id:
-            url = f"{url}?stream_id={stream_id}"
-
-    # Time the write operation for adaptive throttling
-    start_time = time.time()
-    wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode", dry_run)
-    if wrote and throttle:
-        throttle.record_write(time.time() - start_time)
-
-    title = getattr(episode, "name", "") or ""
-    with lock:
-        report_rows.append(["episode", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
-
-    if write_nfos and not dry_run:
-        # tvshow.nfo (only write once per series - in series root directory)
-        should_write_tvshow = False
-
-        if written_tvshows is not None:
-            with lock:
-                if series.id not in written_tvshows:
-                    written_tvshows.add(series.id)
-                    should_write_tvshow = True
-        else:
-            # Fallback if no set provided (shouldn't happen)
-            should_write_tvshow = True
-
-        if should_write_tvshow:
-            tvshow_start = time.time()
-            tvshow_nfo_path = s_folder / "tvshow.nfo"
-            clean_series_name = _clean_name(series.name or "", clean_regex)
-            tvshow_nfo_bytes = _nfo_tvshow(series, clean_name=clean_series_name)
-            wrote_tv, reason_tv = _write_if_changed(tvshow_nfo_path, tvshow_nfo_bytes)
-            if wrote_tv and throttle:
-                throttle.record_write(time.time() - tvshow_start)
-            with lock:
-                report_rows.append(["tvshow_nfo", series.name or "", "", "", getattr(series, "year", ""), str(series.uuid), "", str(tvshow_nfo_path), "written" if wrote_tv else "skipped", reason_tv])
-
-        # season.nfo (only write once per season)
-        season_key = (series.id, season_number)
-        should_write_season = False
-
-        if written_seasons is not None:
-            with lock:
-                if season_key not in written_seasons:
-                    written_seasons.add(season_key)
-                    should_write_season = True
-        else:
-            # Fallback if no set provided (shouldn't happen)
-            should_write_season = True
-
-        if should_write_season:
-            season_start = time.time()
-            season_nfo_path = e_folder / "season.nfo"
-            season_nfo_bytes = _nfo_season(series, season_number, clean_series_name=_clean_name(series.name or "", clean_regex))
-            wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
-            if wrote_s and throttle:
-                throttle.record_write(time.time() - season_start)
-            with lock:
-                report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
-
-        # episode nfo
-        ep_start = time.time()
-        ep_nfo_path = e_folder / _episode_nfo_filename(episode)
-        # Pass cleaned episode name for consistency with movie/season NFO generation
-        episode_name = _clean_name(getattr(episode, "name", "") or "", clean_regex)
-        ep_nfo_bytes = _nfo_episode(episode, clean_name=episode_name)
-        wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
-        if wrote_e and throttle:
-            throttle.record_write(time.time() - ep_start)
-        with lock:
-            report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
-
-
-# -------------------- Cleanup --------------------
-
-def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply: bool) -> None:
-    """
-    Identify and optionally remove stale *.strm files that reference UUIDs not present in DB.
-    Also deletes associated NFO files and prunes empty directories.
-    """
-    LOGGER.info("Cleanup started (apply=%s)", apply)
-    manifest_files = manifest.get("files", {})
-    # Convert UUIDs to strings for comparison with regex-extracted UUID strings
-    movie_uuids = set(str(u) for u in _eligible_movie_queryset().values_list("uuid", flat=True))
-    allowed_series_ids = _eligible_series_queryset().values_list("id", flat=True)
-    episode_uuids = set(
-        str(u) for u in Episode.objects.filter(series_id__in=allowed_series_ids).values_list("uuid", flat=True)
-    )
-
-    def check_one(p: Path):
-        try:
-            # Prefer manifest as source of truth (works for both proxy and direct URLs)
-            path_str = str(p)
-            cached = manifest_files.get(path_str)
-            if cached:
-                typ = cached.get("type")
-                uid = cached.get("uuid")
-                if typ in ("movie", "episode") and uid:
-                    present = (uid in movie_uuids) if typ == "movie" else (uid in episode_uuids)
-                    return ("ok", (typ, uid, present))
-
-            # Fallback for legacy files or ones not tracked in manifest
-            data = p.read_text(encoding="utf-8", errors="ignore").strip()
-            # Simple UUID extraction pattern: [a-f0-9-]+
-            # We control .strm generation in proxy mode, so UUIDs are always valid UUID v4 format.
-            m = re.search(r"/proxy/vod/(movie|episode)/([a-f0-9-]+)", data, flags=re.I)
-            if not m:
-                return ("unknown", None)
-            typ, uid = m.group(1).lower(), m.group(2)
-            present = (uid in movie_uuids) if typ == "movie" else (uid in episode_uuids)
-            return ("ok", (typ, uid, present))
-        except Exception as e:
-            return ("error", str(e))
-
-    strm_files = list(root.rglob("*.strm")) if root.exists() else []
-    LOGGER.info("Cleanup scanning %d .strm files", len(strm_files))
-    stale_paths = []
-    deleted_nfos = 0
-
-    for p in strm_files:
-        kind, payload = check_one(p)
-        if kind == "error":
-            rows.append(["cleanup", "", "", p.name, "", "", str(p), "", "error", payload])
-            continue
-        if kind == "unknown":
-            rows.append(["cleanup", "", "", p.name, "", "", str(p), "", "skip", "unknown_url_format"])
-            continue
-        typ, uid, present = payload
-        if present:
-            continue
-        # stale
-        stale_paths.append(p)
-        if apply:
-            try:
-                # Delete the .strm file
-                p.unlink()
-                # Remove from manifest
-                path_str = str(p)
-                with _MANIFEST_LOCK:
-                    if path_str in manifest_files:
-                        del manifest_files[path_str]
-
-                # Delete associated NFO files
-                if typ == "movie":
-                    # Delete movie.nfo in the same folder
-                    nfo_path = p.parent / "movie.nfo"
-                    if nfo_path.exists():
-                        nfo_path.unlink()
-                        deleted_nfos += 1
-                else:  # episode
-                    # Delete S##E##.nfo for this episode
-                    # .strm filename is like "S01E02 - Title.strm", .nfo is "S01E02.nfo"
-                    strm_stem = p.stem  # "S01E02 - Title"
-                    # Extract S##E## pattern
-                    m = re.match(r'(S\d+E\d+)', strm_stem, re.I)
-                    if m:
-                        episode_nfo = p.parent / f"{m.group(1)}.nfo"
-                        if episode_nfo.exists():
-                            episode_nfo.unlink()
-                            deleted_nfos += 1
-
-                rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "deleted", f"stale_{typ}"])
-            except Exception as e:
-                rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "error", f"delete_failed: {e}"])
-        else:
-            rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "would_delete", f"stale_{typ}"])
-
-    # prune empty dirs and season.nfo files in apply mode
-    if apply:
-        pruned_dirs = 0
-        pruned_season_nfos = 0
-        # Walk deepest-first
-        for d in sorted({p.parent for p in stale_paths}, key=lambda x: len(str(x)), reverse=True):
-            try:
-                # Check if season.nfo exists in empty season folder and delete it
-                if d.exists():
-                    season_nfo = d / "season.nfo"
-                    if season_nfo.exists() and not any(f for f in d.iterdir() if f.suffix == '.strm'):
-                        # No .strm files left in season folder, delete season.nfo
-                        season_nfo.unlink()
-                        pruned_season_nfos += 1
-
-                # Delete empty directories
-                cur = d
-                while cur != root and cur.exists() and not any(cur.iterdir()):
-                    cur.rmdir()
-                    pruned_dirs += 1
-                    cur = cur.parent
-            except Exception:
-                pass
-
-        # Clean up tvshow.nfo files in series folders that no longer have any episodes
-        pruned_tvshow_nfos = 0
-        # Track series folders (parent of season folders) from stale episode paths
-        series_folders = set()
-        for p in stale_paths:
-            # Episode paths: root/TV/SeriesName/Season##/episode.strm
-            # Series folder is parent.parent (grandparent of episode.strm)
-            if "TV" in str(p) and len(p.parts) >= 4:
-                # Verify structure: .../TV/SeriesName/Season##/episode.strm
-                series_folder = p.parent.parent  # Skip season folder, get series folder
-                if series_folder.exists() and series_folder != root:
-                    series_folders.add(series_folder)
-
-        # Check each series folder for tvshow.nfo cleanup
-        for series_folder in series_folders:
-            try:
-                tvshow_nfo = series_folder / "tvshow.nfo"
-                # Delete tvshow.nfo if it exists and no .strm files remain in the entire series
-                if tvshow_nfo.exists():
-                    # Check if any .strm files remain anywhere in this series folder tree
-                    if not any(series_folder.rglob("*.strm")):
-                        tvshow_nfo.unlink()
-                        pruned_tvshow_nfos += 1
-                        LOGGER.debug("Deleted orphaned tvshow.nfo: %s", tvshow_nfo)
-            except Exception as e:
-                LOGGER.debug("Failed to check/delete tvshow.nfo in %s: %s", series_folder, e)
-
-        if deleted_nfos > 0:
-            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_nfos", str(deleted_nfos)])
-        if pruned_season_nfos > 0:
-            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_season_nfos", str(pruned_season_nfos)])
-        if pruned_tvshow_nfos > 0:
-            rows.append(["cleanup", "", "", "", "", "", "", "", "deleted_tvshow_nfos", str(pruned_tvshow_nfos)])
-        if pruned_dirs > 0:
-            rows.append(["cleanup", "", "", "", "", "", "", "", "pruned_dirs", str(pruned_dirs)])
-    LOGGER.info("Cleanup finished (apply=%s, deleted_nfos=%d)", apply, deleted_nfos)
-
-
-# -------------------- Jobs --------------------
-
-def _csv_writer(path: Path, header: List[str], rows_iter: Iterable[List[str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for row in rows_iter:
-            w.writerow(row)
-
-
-def _run_job_sync(
-    mode: str,
-    output_root: str,
-    base_url: str,
-    write_nfos: bool,
-    cleanup_mode: str,
-    concurrency: int,
-    debug_logging: bool = False,
-    dry_run: bool = False,
-    adaptive_throttle: bool = True,
-    clean_regex: str | None = None,
-    use_direct_urls: bool = False,
-    multi_provider_mode: bool = False,
-) -> None:
-    _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s multi_provider=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-
-    root = Path(output_root)
-    ts = _ts()
-    report_path = Path(REPORT_ROOT) / f"report_{mode}_{ts}.csv"
-    header = ["type", "series_name", "season", "title", "year", "db_uuid", "strm_path", "nfo_path", "action", "reason"]
-    rows: List[List[str]] = []
-
-    try:
-        # Run cleanup BEFORE generation to remove stale files first
-        # This prevents the bug where newly written files get deleted because
-        # cleanup loads the old manifest before the new one is saved
-        if cleanup_mode in (CLEANUP_PREVIEW, CLEANUP_APPLY):
-            if not dry_run:
-                manifest = _load_manifest(root)
-                _cleanup(rows, root, manifest, apply=(cleanup_mode == CLEANUP_APPLY))
-                # Save updated manifest after cleanup (pruned stale entries)
-                if cleanup_mode == CLEANUP_APPLY:
-                    _save_manifest(root, manifest)
-                    LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
-
-        if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-
-        if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-
-        if mode == "stats":
-            _stats_only(rows, base_url, root, write_nfos)
-
-    except Exception as e:  # pragma: no cover
-        LOGGER.exception("Job failed: %s", e)
-        rows.append(["error", "", "", "", "", "", "", "", "error", str(e)])
-
-    _csv_writer(report_path, header, rows)
-    LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
-
-
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
-    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
-                dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-    # Get all movies with active provider relations
-    # Prefetch ALL active relations (not just highest priority) to generate STRM files for all providers
-    active_movie_relations = M3UMovieRelation.objects.filter(
-        m3u_account__is_active=True,
-    ).filter(
-        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
-
-    qs = _eligible_movie_queryset().prefetch_related(
-        Prefetch('m3u_relations', queryset=active_movie_relations, to_attr='active_relations')
-    ).only(
-        "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo"
-    )
-    all_movies = list(qs)
-    LOGGER.info("Movies found in database: %d", len(all_movies))
-
-    # Load manifest for caching
-    manifest = _load_manifest(root)
-    lock = threading.Lock()
-    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
-
-    # Process in batches to allow adaptive concurrency adjustments
-    batch_size = 100
-    for i in range(0, len(all_movies), batch_size):
-        batch = all_movies[i:i + batch_size]
-        current_workers = throttle.get_workers()
-
-        def job(m: Movie) -> None:
-            try:
-                # Get ALL active relations for this movie
-                relations = getattr(m, 'active_relations', [])
-                if not relations:
-                    # Fallback: query directly if prefetch didn't work
-                    relations = list(active_movie_relations.filter(movie_id=m.id))
-                
-                if not relations:
-                    LOGGER.debug("Movie id=%s has no active provider relations, skipping", m.id)
-                    with lock:
-                        rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "skipped", "no_active_relations"])
-                    return
-                
-                # If single provider mode, only use the first (highest priority) relation
-                if not multi_provider_mode:
-                    relations = [relations[0]]
-                
-                # Generate STRM file for each provider relation
-                # First provider gets no suffix, others get provider name suffix
-                for idx, relation in enumerate(relations):
-                    provider_name = relation.m3u_account.name if relation.m3u_account else None
-                    provider_suffix = None if idx == 0 else provider_name
-                    
-                    # Only write NFO once (for first provider)
-                    write_nfo_for_this = write_nfos and idx == 0
-                    
-                    _make_movie_strm_and_nfo(
-                        m, base_url, root, write_nfo_for_this, rows, lock, manifest, 
-                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix
-                    )
-            except Exception as e:
-                LOGGER.warning("Movie id=%s failed: %s", m.id, e)
-                with lock:
-                    rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
-
-        with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-            list(ex.map(job, batch))
-
-        # Log progress every batch
-        LOGGER.info("Movies: processed %d / %d (current workers: %d)", min(i + batch_size, len(all_movies)), len(all_movies), current_workers)
-
-    # Save manifest after all writes (skip in dry run)
-    if not dry_run:
-        _save_manifest(root, manifest)
-        LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
-
-
-def _cleanup_series_episodes(series_id: int) -> bool:
-    """
-    Targeted cleanup for a single series - deletes episodes and resets cache flags.
-
-    This is called when Dispatcharr issue #556 duplicate key error occurs during
-    series refresh. Instead of leaving corrupted data, we clean the series and
-    allow a retry.
-
-    Args:
-        series_id: The series ID to clean up
-
-    Returns:
-        True if cleanup succeeded, False otherwise
-    """
-    try:
-        with transaction.atomic():
-            # Count what will be deleted
-            episode_count = Episode.objects.filter(series_id=series_id).count()
-
-            if episode_count > 0:
-                # Delete episodes for this series (cascade handles M3UEpisodeRelation)
-                deleted_count, _ = Episode.objects.filter(series_id=series_id).delete()
-                LOGGER.info(
-                    "Cleaned up series_id=%s: deleted %d objects (%d episodes)",
-                    series_id,
-                    deleted_count,
-                    episode_count
-                )
-
-            # Reset cache flags for this series' relations
-            # NOTE: Using raw SQL instead of ORM because:
-            # 1. custom_properties is PostgreSQL JSONB - need to update nested keys without replacing entire object
-            # 2. ORM would require N queries (fetch, modify, save for each relation) = slow + not atomic
-            # 3. PostgreSQL's jsonb_set() does atomic partial updates in a single query
-            # 4. Django ORM lacks native JSONB merge/partial update support
-            relation_count = M3USeriesRelation.objects.filter(series_id=series_id).count()
-            if relation_count > 0:
-                with connection.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE vod_m3useriesrelation
-                        SET custom_properties = jsonb_set(
-                                jsonb_set(
-                                    COALESCE(custom_properties, '{}'::jsonb),
-                                    '{episodes_fetched}', 'false'::jsonb,
-                                    true
-                                ),
-                                '{detailed_fetched}', 'false'::jsonb,
-                                true
-                            ),
-                            last_episode_refresh = NULL
-                        WHERE series_id = %s
-                    """, [series_id])
-                    reset_count = cursor.rowcount
-                    LOGGER.info(
-                        "Reset %d cache flags for series_id=%s",
-                        reset_count,
-                        series_id
-                    )
-
-        return True
-
-    except Exception:
-        LOGGER.exception("Failed to clean up series_id=%s", series_id)
-        return False
-
-
-def _maybe_internal_refresh_series(series: Series) -> bool:
-    """
-    Refresh episodes from the highest priority provider only.
-
-    Since Dispatcharr deduplicates series by TMDB/IMDB ID, all provider relations
-    for a series point to the same series_id. Therefore we only need to call
-    refresh_series_episodes once - from the highest priority provider.
-
-    This avoids redundant refresh calls and potential race conditions when
-    multiple providers try to populate the same episode rows.
-
-    Returns True if episodes were successfully fetched.
-    """
-    try:
-        from apps.vod.tasks import refresh_series_episodes
-    except ImportError:
-        try:
-            from vod.tasks import refresh_series_episodes
-        except ImportError:
-            LOGGER.debug("Could not import refresh_series_episodes; skipping internal refresh.")
-            return False
-
-    try:
-        # Get highest priority active relation only
-        relation = series.m3u_relations.select_related('m3u_account').filter(
-            m3u_account__is_active=True
-        ).order_by('-m3u_account__priority', 'id').first()
-
-        if not relation:
-            LOGGER.debug("Series id=%s has no active M3U account relations", series.id)
-            return False
-
-        LOGGER.info(
-            "Refreshing episodes for series_id=%s from provider %s (priority %s)",
-            series.id,
-            relation.m3u_account.name,
-            relation.m3u_account.priority
-        )
-
-        try:
-            # Call refresh directly (synchronous, matching UI pattern)
-            refresh_series_episodes(
-                relation.m3u_account,
-                series,
-                relation.external_series_id
-            )
-        except Exception as refresh_error:
-            # Check if this is the duplicate key constraint error from issue #556
-            error_str = str(refresh_error)
-            if "duplicate key" in error_str.lower() and "vod_episode" in error_str.lower():
-                LOGGER.warning(
-                    "Dispatcharr issue #556: Duplicate episode constraint violation for series_id=%s. "
-                    "Attempting targeted cleanup and retry...",
-                    series.id
-                )
-                # Clean up corrupted episodes and cache flags for this series
-                if _cleanup_series_episodes(series.id):
-                    LOGGER.info("Cleanup succeeded, retrying refresh for series_id=%s", series.id)
-                    try:
-                        # Retry the refresh once after cleanup
-                        refresh_series_episodes(
-                            relation.m3u_account,
-                            series,
-                            relation.external_series_id
-                        )
-                        LOGGER.info("Retry succeeded for series_id=%s after cleanup", series.id)
-                    except Exception as retry_error:
-                        LOGGER.error(
-                            "Retry failed for series_id=%s after cleanup: %s",
-                            series.id,
-                            retry_error
-                        )
-                        return False
-                else:
-                    LOGGER.error("Cleanup failed for series_id=%s, giving up", series.id)
-                    return False
-            else:
-                LOGGER.warning(
-                    "Episode refresh error for series_id=%s from provider %s: %s",
-                    series.id,
-                    relation.m3u_account.name,
-                    refresh_error
-                )
-                return False
-
-        # Check if we got episodes
-        episode_count = Episode.objects.filter(series_id=series.id).count()
-        if episode_count > 0:
-            LOGGER.info(
-                "Successfully fetched %d episodes from provider %s",
-                episode_count,
-                relation.m3u_account.name
-            )
-            return True
-
-        LOGGER.debug(
-            "Provider %s returned 0 episodes for series_id=%s",
-            relation.m3u_account.name,
-            series.id
-        )
-        return False
-
-    except Exception as e:  # pragma: no cover
-        LOGGER.warning("Episode refresh failed for series_id=%s: %s", series.id, e)
-        return False
-
-
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
-    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
-                dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-    # Only generate .strm files for series with active provider relations
-    # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
-    series_qs = _eligible_series_queryset().annotate(
-        episode_count=Count('episodes', distinct=True)
-    ).only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
-    total = series_qs.count()
-    LOGGER.info("Series to process: %d", total)
-
-    # Load manifest for caching
-    manifest = _load_manifest(root)
-    lock = threading.Lock()
-
-    # Track written seasons and tvshows to avoid duplicate NFO writes
-    written_seasons = set()
-    written_tvshows = set()
-
-    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
-
-    for s in series_qs.iterator(chunk_size=200):
-        try:
-            series_folder = root / "TV" / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None))
-            # Use annotated episode_count to avoid N+1 query
-            expected = getattr(s, 'episode_count', 0)
-
-            if expected == 0:
-                LOGGER.debug("Series id=%s has 0 episodes; attempting internal refresh.", s.id)
-                refreshed = _maybe_internal_refresh_series(s)
-                if refreshed:
-                    # Episodes were fetched, recount (no sleep needed - synchronous call)
-                    expected = _series_expected_count(s.id)
-                else:
-                    # Skip immediately to avoid unnecessary database queries for series we know have no episodes
-                    LOGGER.debug("Could not fetch episodes for series id=%s; skipping.", s.id)
-                    with lock:
-                        rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "refresh_failed"])
-                    continue
-
-            if expected > 0 and _compare_tree_quick(series_folder, expected, write_nfos):
-                with lock:
-                    rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "tree_complete"])
-                continue
-
-            # Generate episodes for the series
-            # If episodes have M3U relations, use those for stream IDs
-            # Otherwise, use series stream URL (provider may not have episode-level streams)
-            # Workaround for Dispatcharr issue #569: Use .distinct() to handle duplicate M3UEpisodeRelation records
-            # Prefetch M3UEpisodeRelation to avoid N+1 queries (one query per episode)
-            # NOTE: Episodes don't have category_id - they inherit from parent series
-            active_episode_relations = M3UEpisodeRelation.objects.filter(
-                m3u_account__is_active=True,
-            ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
-
-            eps_query = Episode.objects.filter(
-                series_id=s.id
-            )
-
-            # Check for duplicate relations (issue #569 detection)
-            total_before_distinct = eps_query.count()
-            eps = list(eps_query.distinct().prefetch_related(
-                Prefetch('m3u_relations', queryset=active_episode_relations, to_attr='active_relations')
-            ).only(
-                "id", "uuid", "name", "season_number", "episode_number",
-                "air_date", "description", "rating", "tmdb_id", "imdb_id"
-            ).order_by("season_number", "episode_number"))
-            total_after_distinct = len(eps)
-
-            if total_before_distinct > total_after_distinct:
-                LOGGER.warning(
-                    "Dispatcharr issue #569: Series '%s' (id=%s) has duplicate M3U relations. "
-                    "Found %d episode relations but only %d unique episodes. Using distinct episodes only.",
-                    s.name,
-                    s.id,
-                    total_before_distinct,
-                    total_after_distinct
-                )
-
-            if not eps:
-                with lock:
-                    rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "no_episodes"])
-                continue
-
-            # Process episodes in batches with adaptive concurrency
-            batch_size = 100
-            for i in range(0, len(eps), batch_size):
-                batch = eps[i:i + batch_size]
-                current_workers = throttle.get_workers()
-
-                def job(e: Episode) -> None:
-                    try:
-                        # Get ALL active relations for this episode
-                        relations = getattr(e, 'active_relations', [])
-                        if not relations:
-                            # Fallback: query directly if prefetch didn't work
-                            relations = list(active_episode_relations.filter(episode_id=e.id))
-                        
-                        if not relations:
-                            LOGGER.debug("Episode id=%s has no active provider relations, skipping", e.id)
-                            with lock:
-                                rows.append(["episode", s.name or "", getattr(e, "season_number", 0) or 0, getattr(e, "name", "") or "", getattr(s, "year", ""), str(e.uuid), "", "", "skipped", "no_active_relations"])
-                            return
-                        
-                        # If single provider mode, only use the first (highest priority) relation
-                        if not multi_provider_mode:
-                            relations = [relations[0]]
-                        
-                        # Generate STRM file for each provider relation
-                        # First provider gets no suffix, others get provider name suffix
-                        for idx, relation in enumerate(relations):
-                            provider_name = relation.m3u_account.name if relation.m3u_account else None
-                            provider_suffix = None if idx == 0 else provider_name
-                            
-                            # Only write NFO once (for first provider)
-                            write_nfo_for_this = write_nfos and idx == 0
-                            
-                            _make_episode_strm_and_nfo(
-                                s, e, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix
-                            )
-                    except Exception as ep_error:
-                        LOGGER.warning("Episode id=%s failed: %s", e.id, ep_error)
-                        with lock:
-                            rows.append(["episode", s.name or "", getattr(e, "season_number", 0) or 0, getattr(e, "name", "") or "", getattr(s, "year", ""), str(e.uuid), "", "", "error", str(ep_error)])
-
-                with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-                    list(ex.map(job, batch))
-
-        except Exception as e:
-            LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
-            with lock:
-                rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(getattr(s, "uuid", "")), "", "", "error", str(e)])
-
-    # Save manifest after all writes (skip in dry run)
-    if not dry_run:
-        _save_manifest(root, manifest)
-        LOGGER.info("Manifest saved with %d tracked files", len(manifest.get("files", {})))
-
-
-def _db_stats() -> str:
-    """
-    Generate database statistics report showing content counts and relationships.
-    Returns formatted string suitable for display in Dispatcharr UI.
-    """
-    from django.db import connection
-
-    stats = []
-    stats.append("=== DATABASE STATISTICS ===\n")
-
-    # Basic counts
-    movies = Movie.objects.count()
-    series = Series.objects.count()
-    episodes = Episode.objects.count()
-
-    stats.append(f"CONTENT COUNTS:")
-    stats.append(f"  Movies: {movies}")
-    stats.append(f"  Series: {series}")
-    stats.append(f"  Episodes: {episodes}\n")
-
-    # M3U account stats
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT ma.id, ma.name, ma.priority, ma.is_active
-                FROM m3u_m3uaccount ma
-                ORDER BY ma.priority DESC, ma.name
-            """)
-            providers = cursor.fetchall()
-
-            if providers:
-                stats.append("M3U PROVIDERS:")
-                for provider_id, name, priority, is_active in providers:
-                    status = "✓" if is_active else "✗"
-                    stats.append(f"  {status} ID {provider_id}: {name} (priority: {priority})")
-                stats.append("")
-
-            # Movies per provider
-            cursor.execute("""
-                SELECT ma.name, ma.id, COUNT(DISTINCT m.id) as count
-                FROM vod_movie m
-                INNER JOIN vod_m3umovierelation mr ON m.id = mr.movie_id
-                INNER JOIN m3u_m3uaccount ma ON mr.m3u_account_id = ma.id
-                GROUP BY ma.name, ma.id
-                ORDER BY count DESC
-            """)
-            movie_counts = cursor.fetchall()
-
-            if movie_counts:
-                stats.append("MOVIES BY PROVIDER:")
-                for name, provider_id, count in movie_counts:
-                    stats.append(f"  {name} (ID {provider_id}): {count} movies")
-                stats.append("")
-
-            # Series per provider
-            cursor.execute("""
-                SELECT ma.name, ma.id, COUNT(DISTINCT s.id) as count
-                FROM vod_series s
-                INNER JOIN vod_m3useriesrelation sr ON s.id = sr.series_id
-                INNER JOIN m3u_m3uaccount ma ON sr.m3u_account_id = ma.id
-                GROUP BY ma.name, ma.id
-                ORDER BY count DESC
-            """)
-            series_counts = cursor.fetchall()
-
-            if series_counts:
-                stats.append("SERIES BY PROVIDER:")
-                for name, provider_id, count in series_counts:
-                    stats.append(f"  {name} (ID {provider_id}): {count} series")
-                stats.append("")
-
-            # Series without episodes
-            cursor.execute("""
-                SELECT COUNT(DISTINCT s.id)
-                FROM vod_series s
-                LEFT JOIN vod_episode e ON s.id = e.series_id
-                WHERE e.id IS NULL
-            """)
-            no_episodes = cursor.fetchone()[0]
-
-            if no_episodes > 0:
-                stats.append(f"WARNINGS:")
-                stats.append(f"  Series without episodes: {no_episodes}")
-                stats.append("")
-
-    except Exception as e:
-        stats.append(f"\nError querying database: {e}")
-
-    return "\n".join(stats)
-
-
-def _db_cleanup() -> str:
-    """
-    Database cleanup - deletes ALL episodes and episode relations, then resets series cache flags.
-    Issue #556 - Quick database cleanup for development/debugging.
-
-    Replicates these operations:
-        1. DELETE FROM vod_episode (cascades to vod_m3uepisoderelation)
-        2. RESET series cache flags (episodes_fetched, detailed_fetched, last_episode_refresh)
-
-        This ensures Dispatcharr will re-fetch episodes on next UI interaction.
-
-    Returns:
-        Formatted string with operation results
-    """
-    results = []
-    results.append("=== DATABASE CLEANUP (Issue #556) ===\n")
-
-    try:
-        # Count what will be deleted/reset
-        episode_count = Episode.objects.count()
-        series_relation_count = M3USeriesRelation.objects.count()
-
-        results.append(f"Episodes to delete: {episode_count}")
-        results.append(f"Series relations to reset: {series_relation_count}")
-
-        if episode_count > 0 or series_relation_count > 0:
-            with transaction.atomic():
-                # Delete all episodes (cascade deletes will handle M3UEpisodeRelation automatically)
-                if episode_count > 0:
-                    deleted_count, details = Episode.objects.all().delete()
-                    results.append(f"\n✓ Deleted {deleted_count} objects:")
-                    for model, count in details.items():
-                        if count > 0:
-                            results.append(f"  - {model}: {count}")
-
-                # Reset series cache flags so Dispatcharr re-fetches episodes on next UI interaction
-                if series_relation_count > 0:
-                    with connection.cursor() as cursor:
-                        cursor.execute("""
-                            UPDATE vod_m3useriesrelation
-                            SET custom_properties = jsonb_set(
-                                    jsonb_set(
-                                        COALESCE(custom_properties, '{}'::jsonb),
-                                        '{episodes_fetched}', 'false'::jsonb,
-                                        true
-                                    ),
-                                    '{detailed_fetched}', 'false'::jsonb,
-                                    true
-                                ),
-                                last_episode_refresh = NULL
-                        """)
-                        reset_count = cursor.rowcount
-                    results.append(f"\n✓ Reset {reset_count} series relation cache flags")
-        else:
-            results.append("\nNothing to delete or reset.")
-
-        results.append("\n✓ Cleanup complete. Dispatcharr will re-fetch episodes on next series view.")
-        LOGGER.info("Database cleanup completed successfully")
-
-    except Exception as e:
-        LOGGER.exception("Database cleanup failed")
-        results.append(f"\nERROR: {e}")
-
-    return "\n".join(results)
-
-
-def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool) -> None:
-    movies = _eligible_movie_queryset().count()
-    series_qs = _eligible_series_queryset()
-    series = series_qs.count()
-    episodes = Episode.objects.filter(series_id__in=series_qs.values_list("id", flat=True)).count()
-
-    rows.append(["stats", "", "", "movies", "", "", "", "", "info", str(movies)])
-    rows.append(["stats", "", "", "series", "", "", "", "", "info", str(series)])
-    rows.append(["stats", "", "", "episodes", "", "", "", "", "info", str(episodes)])
-
-    movies_strm = len(list((root / "Movies").rglob("*.strm"))) if (root / "Movies").exists() else 0
-    tv_strm = len(list((root / "TV").rglob("*.strm"))) if (root / "TV").exists() else 0
-    nfos = len(list(root.rglob("*.nfo"))) if root.exists() else 0
-
-    rows.append(["stats", "", "", "fs_movies_strm", "", "", "", "", "info", str(movies_strm)])
-    rows.append(["stats", "", "", "fs_tv_strm", "", "", "", "", "info", str(tv_strm)])
-    rows.append(["stats", "", "", "fs_nfos", "", "", "", "", "info", str(nfos)])
-
-
-# -------------------- Plugin Class --------------------
 
 class Plugin:
-    name = "vod2strm"
-    version = "0.0.13"
-    description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
+    name = "VOD STRM Generator"
+    version = "0.0.14"
+    description = (
+        "Generate .strm and .nfo files for Dispatcharr VOD content. "
+        "Supports auto-run after VOD refresh completes."
+    )
 
+    # --------------------------------------------------------------------- #
+    #  Settings schema (rendered by Dispatcharr UI)
+    # --------------------------------------------------------------------- #
     fields = [
         {
-            "id": "output_root",
-            "label": "Output Root Folder",
+            "id": "output_dir",
+            "label": "Output Directory",
             "type": "string",
-            "default": DEFAULT_ROOT,
-            "help": "Where to write STRM/NFO files (e.g., /data/STRM).",
-            "required": True,
+            "default": "/data/strm_files",
+            "help_text": "Directory to write .strm and .nfo files",
         },
         {
             "id": "base_url",
-            "label": "Base URL (for .strm)",
+            "label": "Dispatcharr Base URL",
             "type": "string",
-            "default": DEFAULT_BASE_URL,
-            "help": "e.g., http://localhost:9191 or http://dispatcharr:9191",
-            "required": True,
-        },
-        {
-            "id": "use_direct_urls",
-            "label": "Use Direct URLs",
-            "type": "boolean",
-            "default": False,
-            "help": "Write provider URLs directly instead of Dispatcharr proxy URLs.",
-        },
-        {
-            "id": "write_nfos",
-            "label": "Write NFO files",
-            "type": "boolean",
-            "default": True,
-        },
-        {
-            "id": "cleanup_mode",
-            "label": "Cleanup",
-            "type": "select",
-            "options": [
-                {"value": CLEANUP_OFF, "label": "Off"},
-                {"value": CLEANUP_PREVIEW, "label": "Preview (report only)"},
-                {"value": CLEANUP_APPLY, "label": "Apply (delete stale files)"},
-            ],
-            "default": CLEANUP_OFF,
-        },
-        {
-            "id": "concurrency",
-            "label": "Max Filesystem Concurrency",
-            "type": "number",
-            "default": 4,
-            "help": "Maximum concurrent file operations (adaptive throttling will adjust based on NAS performance). Lower values protect slower storage.",
-        },
-        {
-            "id": "adaptive_throttle",
-            "label": "Adaptive Throttling",
-            "type": "boolean",
-            "default": True,
-            "help": "Automatically reduce concurrency when NAS is slow, increase when fast. Protects against I/O overload.",
-        },
-        {
-            "id": "auto_run_after_vod_refresh",
-            "label": "Auto-run after VOD Refresh",
-            "type": "boolean",
-            "default": False,
-            "help": "Automatically generate .strm files after Dispatcharr refreshes VOD content from providers. Uses 30-second debounce to batch multiple refreshes.",
-        },
-        {
-            "id": "debug_logging",
-            "label": "Robust debug logging",
-            "type": "boolean",
-            "default": False,
+            "default": "http://localhost:9191",
+            "help_text": "Base URL for Dispatcharr proxy (used in .strm files)",
         },
         {
             "id": "dry_run",
-            "label": "Dry Run (simulate without writing)",
+            "label": "Dry Run Mode",
             "type": "boolean",
             "default": False,
-            "help": "Simulate generation without creating/modifying files. Useful for testing.",
+            "help_text": (
+                "No files written. Limits to 1000 items. "
+                "Auto-monitor runs always use real mode."
+            ),
         },
         {
-            "id": "name_clean_regex",
-            "label": "Name Cleaning Regex",
-            "type": "string",
-            "default": "",
-            "help": "Optional regex to strip patterns from names (e.g., ^(?:EN|TOP)\s*-\s*). Matches are replaced with empty string.",
+            "id": "verbose",
+            "label": "Verbose Per-Item Logs",
+            "type": "boolean",
+            "default": True,
         },
         {
-            "id": "filter_movie_ids",
-            "label": "Content Filter: Movie IDs",
-            "type": "string",
-            "default": "",
-            "help": "Comma-separated database IDs to include (e.g., '11730,14359'). Leave empty to generate all.",
-        },
-        {
-            "id": "filter_series_ids",
-            "label": "Content Filter: Series IDs",
-            "type": "string",
-            "default": "",
-            "help": "Comma-separated database IDs to include (e.g., '1521,1797,2736'). Leave empty to generate all.",
-        },
-        {
-            "id": "multi_provider_mode",
-            "label": "Multi-Provider Mode",
+            "id": "debug_log",
+            "label": "Debug Logging",
             "type": "boolean",
             "default": False,
-            "help": "Generate STRM files for all providers. When disabled, only generates for the highest priority provider.",
+            "help_text": "Write detailed debug logs to /data/vod_strm_debug.log",
+        },
+        {
+            "id": "populate_episodes",
+            "label": "Pre-populate Episodes",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Automatically populate episode data for each series "
+                "before generating .strm files"
+            ),
+        },
+        {
+            "id": "monitor_interval",
+            "label": "Auto-Monitor Interval (seconds)",
+            "type": "number",
+            "default": 60,
+            "help_text": (
+                "How often (in seconds) the auto-monitor checks for "
+                "completed VOD refreshes. Default 60."
+            ),
         },
     ]
 
+    # --------------------------------------------------------------------- #
+    #  Action buttons shown in UI
+    # --------------------------------------------------------------------- #
     actions = [
-        {"id": "db_stats", "label": "Database Statistics"},
-        {"id": "stats", "label": "Stats (CSV)"},
-        {"id": "generate_movies", "label": "Generate Movies"},
-        {"id": "generate_series", "label": "Generate Series"},
-        {"id": "generate_all", "label": "Generate All"},
-        {"id": "db_cleanup", "label": "🗑️ Delete ALL Episodes"},
+        {"id": "show_stats", "label": "Show Database Statistics"},
+        {
+            "id": "populate_episodes_only",
+            "label": "Populate Episodes Only",
+            "description": "Pre-populate episode data for all series without generating files",
+        },
+        {"id": "write_movies", "label": "Write Movie .STRM Files"},
+        {"id": "write_series", "label": "Write Series .STRM Files"},
+        {
+            "id": "write_all",
+            "label": "Write All (Movies + Series)",
+            "description": "Process movies first, then series",
+        },
+        {
+            "id": "start_auto_monitor",
+            "label": "Start Auto-Monitor",
+            "description": (
+                "Start background monitor that triggers STRM generation "
+                "after each VOD refresh completes"
+            ),
+            "confirm": {
+                "required": True,
+                "title": "Start Auto-Monitor?",
+                "message": (
+                    "This starts a background thread that polls the database "
+                    "every N seconds for VOD refresh completions and auto-generates "
+                    ".strm/.nfo files. The thread runs until you stop it."
+                ),
+            },
+        },
+        {
+            "id": "stop_auto_monitor",
+            "label": "Stop Auto-Monitor",
+            "description": "Stop the background VOD refresh monitor",
+        },
+        {
+            "id": "monitor_status",
+            "label": "Monitor Status",
+            "description": "Check if the auto-monitor is currently running",
+        },
     ]
 
-    def run(self, action_id, params, context):
-        """
-        Dispatcharr calls this when a button is clicked.
-        We enqueue a background job (Celery if available, else a thread).
+    # --------------------------------------------------------------------- #
+    #  Initialisation
+    # --------------------------------------------------------------------- #
+    def __init__(self):
+        self.last_tmdb_request = 0
+        self.debug_logger = None
 
-        Args:
-            action_id: The action being run (e.g., "generate_movies")
-            params: Parameters from the UI (usually empty dict)
-            context: Dict with "settings", "logger", and "actions"
-        """
-        # Ensure signal handlers are registered (lazy init after DB is ready)
-        _ensure_signals_registered()
-
-        # Extract settings from context (new plugin API)
+    # ===================================================================== #
+    #  run() — entry-point called by Dispatcharr plugin system
+    # ===================================================================== #
+    def run(self, action: str, params: dict, context: dict):
         settings = context.get("settings", {})
-        action = action_id  # Keep same variable name for compatibility
+        logger = context.get("logger") or logging.getLogger("vod_strm")
 
-        _configure_file_logger(settings.get("debug_logging", False))
+        try:
+            if action == "show_stats":
+                return self._action_show_stats(settings, logger)
 
-        output_root = Path(settings.get("output_root") or DEFAULT_ROOT)
-        base_url = settings.get("base_url") or DEFAULT_BASE_URL
-        write_nfos = bool(settings.get("write_nfos", True))
-        cleanup_mode = settings.get("cleanup_mode", CLEANUP_OFF)
-        concurrency = int(settings.get("concurrency") or 4)
-        dry_run = bool(settings.get("dry_run", False))
-        adaptive_throttle = bool(settings.get("adaptive_throttle", True))
-        clean_regex = (settings.get("name_clean_regex") or "").strip() or None
-        use_direct_urls = bool(settings.get("use_direct_urls", False))
-        multi_provider_mode = bool(settings.get("multi_provider_mode", False))
+            elif action == "populate_episodes_only":
+                return self._action_populate_episodes(settings, logger)
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s multi_provider=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            elif action == "write_movies":
+                return self._action_write_movies(settings, logger)
 
-        _ensure_dirs()
-        output_root.mkdir(parents=True, exist_ok=True)
+            elif action == "write_series":
+                return self._action_write_series(settings, logger)
 
-        if action == "db_stats":
-            # Database statistics - run synchronously, return immediately
-            try:
-                stats_text = _db_stats()
-                return {"status": "ok", "message": stats_text}
-            except Exception as e:
-                LOGGER.exception("Database statistics failed")
-                return {"status": "error", "message": f"Failed to generate stats: {e}"}
+            elif action == "write_all":
+                return self._action_write_all(settings, logger)
 
-        # Database cleanup (Issue #556) - delete all episodes and episode relations
-        if action == "db_cleanup":
-            try:
-                result_text = _db_cleanup()
-                return {"status": "ok", "message": result_text}
-            except Exception as e:
-                LOGGER.exception("Database cleanup failed")
-                return {"status": "error", "message": f"Failed to delete episodes: {e}"}
+            elif action == "start_auto_monitor":
+                return self._action_start_monitor(settings, logger)
 
-        if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
-        if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
-            return {"status": "ok", "message": msg}
-        if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
-            return {"status": "ok", "message": msg}
-        if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
-            msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
-            return {"status": "ok", "message": msg}
+            elif action == "stop_auto_monitor":
+                return self._action_stop_monitor(logger)
 
-        return {"status": "error", "message": f"Unknown action: {action}"}
+            elif action == "monitor_status":
+                return self._action_monitor_status()
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False):
-        args = {
-            "mode": mode,
-            "output_root": str(output_root),
-            "base_url": base_url,
-            "write_nfos": write_nfos,
-            "cleanup_mode": cleanup_mode,
-            "concurrency": concurrency,
-            "debug_logging": LOGGER.level <= logging.DEBUG,
-            "dry_run": dry_run,
-            "adaptive_throttle": adaptive_throttle,
-            "clean_regex": clean_regex,
-            "use_direct_urls": use_direct_urls,
-            "multi_provider_mode": multi_provider_mode,
+            else:
+                return {"status": "error", "message": f"Unknown action: {action}"}
+
+        except Exception as e:
+            logger.exception("VOD STRM plugin error")
+            return {"status": "error", "message": str(e)}
+
+    # ===================================================================== #
+    #  Action handlers
+    # ===================================================================== #
+
+    def _action_show_stats(self, settings, logger):
+        stats = self._get_vod_stats(logger)
+        return {"status": "ok", **stats}
+
+    def _action_populate_episodes(self, settings, logger):
+        count = self._populate_all_episodes(settings, logger)
+        return {"status": "ok", "message": f"Populated episodes for {count} series"}
+
+    def _action_write_movies(self, settings, logger):
+        dry = settings.get("dry_run", False)
+        result = self._process_movies(settings, logger, dry_run=dry)
+        return {"status": "ok", **result}
+
+    def _action_write_series(self, settings, logger):
+        dry = settings.get("dry_run", False)
+        result = self._process_series(settings, logger, dry_run=dry)
+        return {"status": "ok", **result}
+
+    def _action_write_all(self, settings, logger):
+        dry = settings.get("dry_run", False)
+        m = self._process_movies(settings, logger, dry_run=dry)
+        s = self._process_series(settings, logger, dry_run=dry)
+        return {
+            "status": "ok",
+            "movies": m,
+            "series": s,
         }
 
-        # REASONING: Threading fallback removed
-        # This plugin runs inside Dispatcharr, which requires Celery to function.
-        # If Celery is unavailable, Dispatcharr itself won't be running, so there's
-        # no scenario where this plugin is active but Celery is down.
-        # Removing the threading fallback simplifies the code and removes unnecessary
-        # complexity for a scenario that cannot occur in production.
+    # ------------------------------------------------------------------ #
+    #  Auto-monitor actions
+    # ------------------------------------------------------------------ #
 
-        if not celery_app:
-            LOGGER.error("Celery not available - cannot enqueue background task. This should not happen if Dispatcharr is running correctly.")
-            return
+    def _action_start_monitor(self, settings, logger):
+        global _monitor_thread, _monitor_stop_event
 
-        # Try to call the task - use send_task as fallback if direct call fails
-        task_name = "vod2strm.plugin.run_job"
-        try:
-            if celery_run_job is not None:
-                # Direct call if function is available
-                celery_run_job.delay(args)
-                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
-            else:
-                # Fallback: send by name (works even if module not imported by worker yet)
-                celery_app.send_task(task_name, args=[args])
-                LOGGER.info("Enqueued Celery task %s by name (mode=%s, dry_run=%s)", task_name, mode, dry_run)
-        except Exception as e:
-            LOGGER.warning("Failed to enqueue task directly, trying send_task by name: %s", e)
-            # Fallback: send by name
-            celery_app.send_task(task_name, args=[args])
-            LOGGER.info("Enqueued Celery task %s by name (fallback, mode=%s)", task_name, mode)
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return {
+                "status": "ok",
+                "message": "Auto-monitor is already running.",
+            }
 
+        _monitor_stop_event.clear()
+        interval = int(settings.get("monitor_interval", 60))
 
-# -------------------- Celery task registration --------------------
-# Register tasks dynamically with Celery app at module import time
-# This ensures tasks are registered in both Django process and Celery workers
+        _monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            args=(settings, interval),
+            daemon=True,
+            name="vod-strm-monitor",
+        )
+        _monitor_thread.start()
 
-# Define and register Celery tasks using @shared_task decorator
-# This is the standard Django/Celery pattern that works with autodiscovery
+        return {
+            "status": "ok",
+            "message": (
+                f"Auto-monitor started. Checking every {interval}s "
+                f"for VOD refresh completions."
+            ),
+        }
 
-# Only define tasks if shared_task is available
-if shared_task is not None:
-    @shared_task(name="vod2strm.plugin.run_job")
-    def celery_run_job(args: dict):
+    def _action_stop_monitor(self, logger):
+        global _monitor_thread, _monitor_stop_event
+
+        if _monitor_thread is None or not _monitor_thread.is_alive():
+            return {"status": "ok", "message": "Auto-monitor is not running."}
+
+        _monitor_stop_event.set()
+        _monitor_thread.join(timeout=10)
+        _monitor_thread = None
+        logger.info("Auto-monitor stopped.")
+        return {"status": "ok", "message": "Auto-monitor stopped."}
+
+    def _action_monitor_status(self):
+        global _monitor_thread
+        running = _monitor_thread is not None and _monitor_thread.is_alive()
+        return {
+            "status": "ok",
+            "monitor_running": running,
+            "message": "Auto-monitor is RUNNING" if running else "Auto-monitor is STOPPED",
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Monitor loop (runs in daemon thread)
+    # ------------------------------------------------------------------ #
+
+    def _monitor_loop(self, settings, interval: int):
         """
-        Celery task for background STRM generation.
-        Worker process imports this module via autodiscovery.
-        """
-        LOGGER.info("Celery task run_job starting with args: %s", args)
-        try:
-            _run_job_sync(**args)
-            LOGGER.info("Celery task run_job completed successfully")
-        except Exception as e:
-            LOGGER.error("Celery task run_job failed: %s", e, exc_info=True)
-            raise
+        Periodically check M3UAccount.updated_at for VOD-enabled accounts.
+        When an account's updated_at advances past our last-seen timestamp
+        AND its last_message indicates a successful VOD refresh, trigger
+        STRM/NFO generation for that account's content.
 
-
-    @shared_task(name="vod2strm.plugin.generate_all")
-    def celery_generate_all():
+        This approach:
+        - Runs in the web process (where plugins are loaded)
+        - Reads DB written by the Celery worker (cross-process safe)
+        - 2 lightweight queries per check cycle
+        - No monkey-patching, no upstream changes
         """
-        Celery task for scheduled STRM generation.
-        Worker process imports this module via autodiscovery.
-        """
-        try:
-            from apps.plugins.models import PluginConfig
-            plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-            if plugin_config and plugin_config.settings:
-                settings = plugin_config.settings
-            else:
-                settings = {}
-        except Exception as e:
-            LOGGER.warning("Failed to load plugin settings for scheduled task: %s. Using defaults.", e)
-            settings = {}
+        logger = logging.getLogger("vod_strm.monitor")
+        logger.info("Auto-monitor thread started (interval=%ds)", interval)
 
-        LOGGER.info("Celery scheduled task generate_all starting")
+        # Track when we last saw each account's updated_at
+        last_seen: Dict[int, datetime] = {}
+
+        # Initialise last_seen with current timestamps so we don't
+        # immediately trigger on existing data
         try:
-            _run_job_sync(
-                mode="all",
-                output_root=settings.get("output_root") or DEFAULT_ROOT,
-                base_url=settings.get("base_url") or DEFAULT_BASE_URL,
-                write_nfos=bool(settings.get("write_nfos", True)),
-                cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-                concurrency=int(settings.get("concurrency", 4)),
-                adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
-                debug_logging=bool(settings.get("debug_logging", False)),
-                dry_run=False,  # Scheduled runs always run for real
-                clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
-                use_direct_urls=bool(settings.get("use_direct_urls", False)),
-                multi_provider_mode=bool(settings.get("multi_provider_mode", False)),
+            for acct in M3UAccount.objects.filter(is_active=True, enable_vod=True):
+                if acct.updated_at:
+                    last_seen[acct.id] = acct.updated_at
+            logger.info(
+                "Initialised tracking for %d VOD-enabled accounts", len(last_seen)
             )
-            LOGGER.info("Celery scheduled task generate_all completed successfully")
         except Exception as e:
-            LOGGER.error("Celery scheduled task generate_all failed: %s", e, exc_info=True)
-            raise
+            logger.error("Failed to initialise monitor: %s", e)
 
-    # Tasks are auto-discovered by Celery when the module is imported
-    # Dispatcharr's plugin system should handle module loading
-    # If tasks aren't found, restart the Celery worker after plugin installation
-else:
-    # Celery not available - define placeholder functions
-    celery_run_job = None
-    celery_generate_all = None
+        while not _monitor_stop_event.is_set():
+            _monitor_stop_event.wait(timeout=interval)
+            if _monitor_stop_event.is_set():
+                break
 
-
-# -------------------- Auto-run after VOD refresh --------------------
-
-# Debounce state for auto-run (process-local for timer management)
-_auto_run_debounce_timer = None
-_auto_run_lock = threading.Lock()
-
-# Cross-process coordination using Django cache
-# Cache key tracks whether auto-run is currently executing across all workers
-AUTO_RUN_CACHE_KEY = "vod2strm_auto_run_in_progress"
-
-
-def _schedule_auto_run_after_vod_refresh():
-    """
-    Schedule an auto-run with 30-second debounce.
-    Multiple VOD refreshes within 30 seconds will only trigger one generation.
-    """
-    global _auto_run_debounce_timer
-
-    # Load settings to check if auto-run is enabled
-    try:
-        from apps.plugins.models import PluginConfig
-        plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-        if not plugin_config or not plugin_config.settings:
-            return
-
-        # Check if plugin is enabled (respects UI disable toggle)
-        if not plugin_config.enabled:
-            LOGGER.debug("Auto-run skipped: plugin is disabled")
-            return
-
-        settings = plugin_config.settings
-        if not settings.get("auto_run_after_vod_refresh", False):
-            return  # Feature disabled
-
-        with _auto_run_lock:
-            # Cancel existing timer
-            if _auto_run_debounce_timer:
-                _auto_run_debounce_timer.cancel()
-
-            # Schedule new run in 30 seconds
-            def run_generation():
-                """
-                Execute debounced STRM generation job.
-
-                Reloads settings from database to avoid using stale settings captured
-                in closure. Re-checks plugin enabled state before executing.
-                Uses Django cache for cross-process coordination to prevent multiple
-                workers from running simultaneously. Cache key acts as distributed lock.
-                """
-                from django.core.cache import cache
-
-                LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
-
-                # Try to acquire distributed lock using cache (atomic operation)
-                # set with nx=True (only set if not exists) acts as a lock
-                # Timeout of 3600s (1 hour) prevents stuck locks if process crashes
-                lock_acquired = cache.add(AUTO_RUN_CACHE_KEY, "locked", timeout=3600)
-
-                if not lock_acquired:
-                    LOGGER.info("Auto-run already in progress in another worker, skipping")
-                    return
-
-                try:
-                    # Reload settings from database (avoid stale settings from closure)
-                    from apps.plugins.models import PluginConfig
-                    plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-
-                    # Double-check plugin is still enabled before running
-                    if not plugin_config or not plugin_config.enabled:
-                        LOGGER.info("Auto-run cancelled: plugin was disabled during debounce window")
-                        return
-
-                    # Double-check auto-run is still enabled
-                    current_settings = plugin_config.settings or {}
-                    if not current_settings.get("auto_run_after_vod_refresh", False):
-                        LOGGER.info("Auto-run cancelled: feature was disabled during debounce window")
-                        return
-
-                    _run_job_sync(
-                        mode="all",
-                        output_root=current_settings.get("output_root") or DEFAULT_ROOT,
-                        base_url=current_settings.get("base_url") or DEFAULT_BASE_URL,
-                        write_nfos=bool(current_settings.get("write_nfos", True)),
-                        cleanup_mode=current_settings.get("cleanup_mode", CLEANUP_OFF),
-                        concurrency=int(current_settings.get("concurrency") or 4),
-                        debug_logging=bool(current_settings.get("debug_logging", False)),
-                        dry_run=False,
-                        adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
-                        clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
-                        use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
-                        multi_provider_mode=bool(current_settings.get("multi_provider_mode", False)),
-                    )
-                finally:
-                    # Release distributed lock
-                    cache.delete(AUTO_RUN_CACHE_KEY)
-                    LOGGER.debug("Auto-run completed, lock released")
-
-            _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
-            _auto_run_debounce_timer.daemon = True
-            _auto_run_debounce_timer.start()
-            LOGGER.debug("Auto-run scheduled in 30 seconds (debounced)")
-
-    except Exception as e:
-        LOGGER.warning("Failed to schedule auto-run after VOD refresh: %s", e)
-
-
-def _ensure_signals_registered():
-    """
-    Lazily register Django signal handlers when first needed (after DB is ready).
-
-    IMPORTANT: Dispatcharr changed plugin loading in commit 1200d7d (Sept 2025).
-    Plugins now load in two phases:
-      1. discover_plugins(sync_db=False) - before DB/migrations ready
-      2. discover_plugins(sync_db=True) - after migrations complete
-
-    Module-level code executes during phase 1 (DB not ready), but Python's
-    module caching prevents it from running again in phase 2. This function
-    provides lazy initialization that runs when Plugin.run() is first called,
-    ensuring signals register after the database is fully ready.
-    """
-    global _SIGNALS_REGISTERED
-
-    # Use lock to prevent race conditions during concurrent initialization
-    with _LOG_LOCK:
-        if _SIGNALS_REGISTERED:
-            return  # Already registered
-
-        try:
-            from django.db.models.signals import post_save
-            from django.dispatch import receiver
-
-            # Import models to verify DB is ready
             try:
-                from apps.vod.models import (
-                    Episode,
-                    Movie,
-                    M3UMovieRelation,
-                    M3UEpisodeRelation,
+                self._monitor_check(settings, logger, last_seen)
+            except Exception as e:
+                logger.error("Monitor check error: %s", e)
+
+        logger.info("Auto-monitor thread exiting.")
+
+    def _monitor_check(
+        self,
+        settings: dict,
+        logger: logging.Logger,
+        last_seen: Dict[int, datetime],
+    ):
+        """Single check cycle: look for accounts whose VOD refresh completed."""
+        accounts = M3UAccount.objects.filter(is_active=True, enable_vod=True)
+
+        for acct in accounts:
+            acct_updated = acct.updated_at
+            if acct_updated is None:
+                continue
+
+            prev = last_seen.get(acct.id)
+
+            # Account is newer than what we last saw
+            if prev is None or acct_updated > prev:
+                # Check if last_message indicates VOD refresh success
+                msg = (acct.last_message or "").lower()
+                if self._is_vod_refresh_complete(msg):
+                    logger.info(
+                        "VOD refresh detected for account '%s' (id=%d). "
+                        "Triggering STRM generation.",
+                        acct.name,
+                        acct.id,
+                    )
+                    try:
+                        self._run_full_generation(settings, logger)
+                    except Exception as e:
+                        logger.error(
+                            "Auto-generation failed for account %d: %s",
+                            acct.id,
+                            e,
+                        )
+
+                # Update tracking regardless (so we don't re-trigger)
+                last_seen[acct.id] = acct_updated
+
+    @staticmethod
+    def _is_vod_refresh_complete(msg: str) -> bool:
+        """
+        Heuristic to detect whether an M3UAccount.last_message indicates
+        a completed VOD refresh.  Dispatcharr sets messages like:
+          - "Batch VOD refresh completed ..."
+          - "VOD refresh completed: X movies, Y series"
+          - Could also be "success" status
+        """
+        indicators = [
+            "vod refresh completed",
+            "vod refresh complete",
+            "batch vod refresh",
+            "vod content refresh",
+        ]
+        return any(ind in msg for ind in indicators)
+
+    def _run_full_generation(self, settings: dict, logger: logging.Logger):
+        """Run full movies + series generation (used by auto-monitor)."""
+        logger.info("=== Auto-monitor: starting full STRM generation ===")
+        m = self._process_movies(settings, logger, dry_run=False)
+        logger.info("Movies result: %s", m)
+        s = self._process_series(settings, logger, dry_run=False)
+        logger.info("Series result: %s", s)
+        logger.info("=== Auto-monitor: STRM generation complete ===")
+
+    # ===================================================================== #
+    #  Database statistics
+    # ===================================================================== #
+
+    def _get_vod_stats(self, logger) -> Dict[str, Any]:
+        movie_count = Movie.objects.count()
+        series_count = Series.objects.count()
+        episode_count = Episode.objects.count()
+        movie_rel_count = M3UMovieRelation.objects.count()
+        series_rel_count = M3USeriesRelation.objects.count()
+        episode_rel_count = M3UEpisodeRelation.objects.count()
+
+        # VOD-enabled accounts
+        vod_accounts = list(
+            M3UAccount.objects.filter(is_active=True, enable_vod=True)
+            .values_list("id", "name")
+        )
+
+        return {
+            "movies": movie_count,
+            "series": series_count,
+            "episodes": episode_count,
+            "movie_relations": movie_rel_count,
+            "series_relations": series_rel_count,
+            "episode_relations": episode_rel_count,
+            "vod_accounts": [
+                {"id": aid, "name": aname} for aid, aname in vod_accounts
+            ],
+        }
+
+    # ===================================================================== #
+    #  Episode population (uses Dispatcharr's own task)
+    # ===================================================================== #
+
+    def _populate_all_episodes(self, settings, logger) -> int:
+        """
+        Trigger episode population for every series that has an
+        M3USeriesRelation.  Uses Dispatcharr's refresh_series_episodes.
+        """
+        from apps.vod.tasks import refresh_series_episodes
+
+        relations = (
+            M3USeriesRelation.objects
+            .filter(m3u_account__is_active=True)
+            .select_related("series", "m3u_account")
+        )
+
+        count = 0
+        for rel in relations:
+            series = rel.series
+            logger.info(
+                "Populating episodes for series '%s' (account=%s)",
+                series.name,
+                rel.m3u_account.name,
+            )
+            try:
+                refresh_series_episodes(
+                    series.id,
+                    rel.m3u_account.id,
+                    rel.external_series_id,
                 )
-            except ImportError:
-                from vod.models import (
-                    Episode,
-                    Movie,
-                    M3UMovieRelation,
-                    M3UEpisodeRelation,
+                count += 1
+            except Exception as e:
+                logger.error(
+                    "Failed to populate episodes for '%s': %s", series.name, e
                 )
 
-            # Define signal handlers
-            @receiver(post_save, sender=Episode)
-            def on_episode_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when Episode model is saved.
+        return count
 
-                Schedules auto-run generation only when NEW episodes are created (not updates).
-                Checks cache-based distributed lock to prevent infinite loops when our own
-                _maybe_internal_refresh_series() creates episodes during generation.
-                """
-                from django.core.cache import cache
+    # ===================================================================== #
+    #  Movie processing
+    # ===================================================================== #
 
-                # Don't trigger if we're already running (prevents infinite loop)
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
+    def _process_movies(self, settings, logger, dry_run=False) -> dict:
+        output_dir = settings.get("output_dir", "/data/strm_files")
+        base_url = settings.get("base_url", "http://localhost:9191").rstrip("/")
+        verbose = settings.get("verbose", True)
+        movies_dir = os.path.join(output_dir, "Movies")
 
-            @receiver(post_save, sender=Movie)
-            def on_movie_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when Movie model is saved.
+        if not dry_run:
+            os.makedirs(movies_dir, exist_ok=True)
 
-                Schedules auto-run generation only when NEW movies are created (not updates).
-                Checks cache-based distributed lock to prevent re-triggering during active runs.
-                """
-                from django.core.cache import cache
+        # Get all movie relations with active accounts
+        relations = (
+            M3UMovieRelation.objects
+            .filter(m3u_account__is_active=True)
+            .select_related("movie", "movie__logo", "m3u_account")
+            .order_by("movie__name")
+        )
 
-                # Don't trigger if we're already running
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
+        # Deduplicate by movie id (pick highest-priority account)
+        best: Dict[int, M3UMovieRelation] = {}
+        for rel in relations:
+            mid = rel.movie_id
+            if mid not in best or rel.m3u_account.priority > best[mid].m3u_account.priority:
+                best[mid] = rel
 
-            @receiver(post_save, sender=M3UMovieRelation)
-            def on_movie_relation_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when M3UMovieRelation is saved.
+        total = len(best)
+        if dry_run:
+            total = min(total, 1000)
 
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing movies get linked to a new/higher priority provider.
-                """
-                from django.core.cache import cache
+        written = 0
+        skipped = 0
+        errors = 0
 
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
+        for idx, rel in enumerate(list(best.values())[:total]):
+            movie = rel.movie
+            try:
+                # Build filename-safe title
+                title = self._sanitise_filename(movie.name)
+                year = movie.year
+                if year:
+                    # Strip trailing year if already in title
+                    title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+                    folder_name = f"{title} ({year})"
+                else:
+                    folder_name = title
 
-            @receiver(post_save, sender=M3UEpisodeRelation)
-            def on_episode_relation_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when M3UEpisodeRelation is saved.
+                movie_folder = os.path.join(movies_dir, folder_name)
 
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing episodes get linked to a new/higher priority provider.
-                """
-                from django.core.cache import cache
+                # .strm URL
+                strm_url = f"{base_url}/proxy/vod/movie/{movie.uuid}"
 
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
+                # .nfo content
+                nfo_xml = self._build_movie_nfo(movie, rel)
 
-            _SIGNALS_REGISTERED = True
-            LOGGER.info("VOD refresh signal handlers registered successfully (lazy init)")
+                if not dry_run:
+                    os.makedirs(movie_folder, exist_ok=True)
+                    strm_path = os.path.join(movie_folder, f"{folder_name}.strm")
+                    nfo_path = os.path.join(movie_folder, f"{folder_name}.nfo")
 
-        except ImportError as e:
-            LOGGER.warning("Could not register VOD refresh signal handlers (models not available): %s", e)
+                    self._write_if_changed(strm_path, strm_url)
+                    self._write_if_changed(nfo_path, nfo_xml)
+
+                written += 1
+                if verbose and idx % 100 == 0:
+                    logger.info("Movies progress: %d / %d", idx + 1, total)
+
+            except Exception as e:
+                errors += 1
+                logger.error("Error processing movie '%s': %s", movie.name, e)
+
+        logger.info(
+            "Movies done: %d written, %d skipped, %d errors out of %d",
+            written, skipped, errors, total,
+        )
+        return {
+            "total": total,
+            "written": written,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    # ===================================================================== #
+    #  Series processing (series-by-series with episode population)
+    # ===================================================================== #
+
+    def _process_series(self, settings, logger, dry_run=False) -> dict:
+        output_dir = settings.get("output_dir", "/data/strm_files")
+        base_url = settings.get("base_url", "http://localhost:9191").rstrip("/")
+        verbose = settings.get("verbose", True)
+        populate = settings.get("populate_episodes", True)
+        series_dir = os.path.join(output_dir, "TV Shows")
+
+        if not dry_run:
+            os.makedirs(series_dir, exist_ok=True)
+
+        # Get all series relations with active accounts
+        series_rels = (
+            M3USeriesRelation.objects
+            .filter(m3u_account__is_active=True)
+            .select_related("series", "series__logo", "m3u_account")
+            .order_by("series__name")
+        )
+
+        # Deduplicate by series id
+        best_series: Dict[int, M3USeriesRelation] = {}
+        for rel in series_rels:
+            sid = rel.series_id
+            if sid not in best_series or rel.m3u_account.priority > best_series[sid].m3u_account.priority:
+                best_series[sid] = rel
+
+        total_series = len(best_series)
+        if dry_run:
+            total_series = min(total_series, 50)
+
+        series_written = 0
+        episodes_written = 0
+        errors = 0
+
+        for idx, srel in enumerate(list(best_series.values())[:total_series]):
+            series = srel.series
+            try:
+                # Step 1: Populate episodes for this series if enabled
+                if populate and not dry_run:
+                    self._populate_series_episodes(srel, logger)
+
+                # Step 2: Get episodes for this series
+                ep_rels = (
+                    M3UEpisodeRelation.objects
+                    .filter(
+                        episode__series=series,
+                        m3u_account__is_active=True,
+                    )
+                    .select_related("episode", "m3u_account")
+                    .order_by("episode__season_number", "episode__episode_number")
+                )
+
+                if not ep_rels.exists():
+                    if verbose:
+                        logger.info(
+                            "Series '%s' has no episodes, skipping.", series.name
+                        )
+                    continue
+
+                # Build series folder
+                title = self._sanitise_filename(series.name)
+                year = series.year
+                if year:
+                    title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+                    series_folder_name = f"{title} ({year})"
+                else:
+                    series_folder_name = title
+
+                series_folder = os.path.join(series_dir, series_folder_name)
+
+                if not dry_run:
+                    os.makedirs(series_folder, exist_ok=True)
+
+                    # Write series-level tvshow.nfo
+                    nfo_xml = self._build_series_nfo(series, srel)
+                    nfo_path = os.path.join(series_folder, "tvshow.nfo")
+                    self._write_if_changed(nfo_path, nfo_xml)
+
+                # Step 3: Write episode files
+                # Deduplicate episodes
+                best_eps: Dict[int, M3UEpisodeRelation] = {}
+                for erel in ep_rels:
+                    eid = erel.episode_id
+                    if eid not in best_eps or erel.m3u_account.priority > best_eps[eid].m3u_account.priority:
+                        best_eps[eid] = erel
+
+                for erel in best_eps.values():
+                    ep = erel.episode
+                    snum = ep.season_number or 0
+                    epnum = ep.episode_number or 0
+
+                    season_folder = os.path.join(
+                        series_folder, f"Season {snum:02d}"
+                    )
+
+                    ep_title = self._sanitise_filename(ep.name or "Episode")
+                    ep_filename = (
+                        f"{series_folder_name} - "
+                        f"S{snum:02d}E{epnum:02d} - {ep_title}"
+                    )
+
+                    strm_url = f"{base_url}/proxy/vod/episode/{ep.uuid}"
+
+                    if not dry_run:
+                        os.makedirs(season_folder, exist_ok=True)
+                        strm_path = os.path.join(
+                            season_folder, f"{ep_filename}.strm"
+                        )
+                        nfo_path = os.path.join(
+                            season_folder, f"{ep_filename}.nfo"
+                        )
+                        nfo_xml = self._build_episode_nfo(ep, erel, series)
+                        self._write_if_changed(strm_path, strm_url)
+                        self._write_if_changed(nfo_path, nfo_xml)
+
+                    episodes_written += 1
+
+                series_written += 1
+                if verbose:
+                    logger.info(
+                        "Series %d/%d: '%s' — %d episodes",
+                        idx + 1,
+                        total_series,
+                        series.name,
+                        len(best_eps),
+                    )
+
+            except Exception as e:
+                errors += 1
+                logger.error("Error processing series '%s': %s", series.name, e)
+
+        logger.info(
+            "Series done: %d series, %d episodes, %d errors",
+            series_written, episodes_written, errors,
+        )
+        return {
+            "total_series": total_series,
+            "series_written": series_written,
+            "episodes_written": episodes_written,
+            "errors": errors,
+        }
+
+    def _populate_series_episodes(self, srel: M3USeriesRelation, logger):
+        """Populate episodes for a single series using Dispatcharr's task."""
+        try:
+            from apps.vod.tasks import refresh_series_episodes
+
+            refresh_series_episodes(
+                srel.series.id,
+                srel.m3u_account.id,
+                srel.external_series_id,
+            )
         except Exception as e:
-            LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
+            logger.warning(
+                "Could not populate episodes for '%s': %s",
+                srel.series.name,
+                e,
+            )
 
+    # ===================================================================== #
+    #  NFO builders
+    # ===================================================================== #
 
-# ============================================================================
-# OLD MODULE-LEVEL SIGNAL REGISTRATION (DISABLED)
-# ============================================================================
-# This code was removed because Dispatcharr commit 1200d7d (Sept 2025) changed
-# plugin loading to happen before the database is ready. Module-level code
-# executes during initial import, but Python's module caching prevents it from
-# running again after migrations complete. Signal registration now happens via
-# _ensure_signals_registered() which is called lazily from Plugin.run().
-# ============================================================================
-#
-# try:
-#     from django.db.models.signals import post_save, post_delete
-#     from django.dispatch import receiver
-#
-#     @receiver(post_save, sender=Episode)
-#     def on_episode_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=Movie)
-#     def on_movie_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=M3UMovieRelation)
-#     def on_movie_relation_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=M3UEpisodeRelation)
-#     def on_episode_relation_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     LOGGER.info("VOD refresh signal handlers registered (including provider relation handlers)")
-#
-# except ImportError:
-#     LOGGER.warning("Could not register VOD refresh signal handlers (Django signals not available)")
-# except Exception as e:
-#     LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
-# ============================================================================
+    def _build_movie_nfo(self, movie: Movie, rel: M3UMovieRelation) -> str:
+        root = ET.Element("movie")
+        self._add_text_el(root, "title", movie.name)
+        if movie.year:
+            self._add_text_el(root, "year", str(movie.year))
+        if movie.description:
+            self._add_text_el(root, "plot", movie.description)
+        if movie.rating:
+            self._add_text_el(root, "rating", movie.rating)
+        if movie.genre:
+            for g in movie.genre.split(","):
+                self._add_text_el(root, "genre", g.strip())
+        if movie.tmdb_id:
+            self._add_text_el(root, "tmdbid", str(movie.tmdb_id))
+            uid = ET.SubElement(root, "uniqueid", type="tmdb", default="true")
+            uid.text = str(movie.tmdb_id)
+        if movie.imdb_id:
+            self._add_text_el(root, "imdbid", str(movie.imdb_id))
+            uid = ET.SubElement(root, "uniqueid", type="imdb")
+            uid.text = str(movie.imdb_id)
+        if movie.duration_secs:
+            self._add_text_el(
+                root, "runtime", str(movie.duration_secs // 60)
+            )
+
+        # Poster from logo or custom_properties
+        poster_url = self._get_poster_url(movie)
+        if poster_url:
+            thumb = ET.SubElement(root, "thumb", aspect="poster")
+            thumb.text = poster_url
+
+        # Provider info from custom_properties
+        cp = rel.custom_properties or {}
+        if cp.get("director"):
+            self._add_text_el(root, "director", cp["director"])
+        if cp.get("cast"):
+            cast_str = cp["cast"]
+            if isinstance(cast_str, str):
+                for actor_name in cast_str.split(","):
+                    actor = ET.SubElement(root, "actor")
+                    self._add_text_el(actor, "name", actor_name.strip())
+
+        return self._xml_to_string(root)
+
+    def _build_series_nfo(self, series: Series, srel: M3USeriesRelation) -> str:
+        root = ET.Element("tvshow")
+        self._add_text_el(root, "title", series.name)
+        if series.year:
+            self._add_text_el(root, "year", str(series.year))
+        if series.description:
+            self._add_text_el(root, "plot", series.description)
+        if series.rating:
+            self._add_text_el(root, "rating", series.rating)
+        if series.genre:
+            for g in series.genre.split(","):
+                self._add_text_el(root, "genre", g.strip())
+        if series.tmdb_id:
+            self._add_text_el(root, "tmdbid", str(series.tmdb_id))
+            uid = ET.SubElement(root, "uniqueid", type="tmdb", default="true")
+            uid.text = str(series.tmdb_id)
+        if series.imdb_id:
+            self._add_text_el(root, "imdbid", str(series.imdb_id))
+            uid = ET.SubElement(root, "uniqueid", type="imdb")
+            uid.text = str(series.imdb_id)
+
+        poster_url = self._get_poster_url(series)
+        if poster_url:
+            thumb = ET.SubElement(root, "thumb", aspect="poster")
+            thumb.text = poster_url
+
+        # Provider custom properties
+        cp = srel.custom_properties or {}
+        if cp.get("cast"):
+            cast_str = cp["cast"]
+            if isinstance(cast_str, str):
+                for actor_name in cast_str.split(","):
+                    actor = ET.SubElement(root, "actor")
+                    self._add_text_el(actor, "name", actor_name.strip())
+
+        return self._xml_to_string(root)
+
+    def _build_episode_nfo(
+        self, ep: Episode, erel: M3UEpisodeRelation, series: Series
+    ) -> str:
+        root = ET.Element("episodedetails")
+        self._add_text_el(root, "title", ep.name)
+        self._add_text_el(root, "showtitle", series.name)
+        if ep.season_number is not None:
+            self._add_text_el(root, "season", str(ep.season_number))
+        if ep.episode_number is not None:
+            self._add_text_el(root, "episode", str(ep.episode_number))
+        if ep.description:
+            self._add_text_el(root, "plot", ep.description)
+        if ep.air_date:
+            self._add_text_el(root, "aired", str(ep.air_date))
+        if ep.rating:
+            self._add_text_el(root, "rating", ep.rating)
+        if ep.duration_secs:
+            self._add_text_el(root, "runtime", str(ep.duration_secs // 60))
+        if ep.tmdb_id:
+            uid = ET.SubElement(root, "uniqueid", type="tmdb", default="true")
+            uid.text = str(ep.tmdb_id)
+        if ep.imdb_id:
+            uid = ET.SubElement(root, "uniqueid", type="imdb")
+            uid.text = str(ep.imdb_id)
+
+        # Episode thumbnail from custom_properties
+        cp = ep.custom_properties or {}
+        if cp.get("info", {}).get("movie_image"):
+            thumb = ET.SubElement(root, "thumb")
+            thumb.text = cp["info"]["movie_image"]
+
+        return self._xml_to_string(root)
+
+    # ===================================================================== #
+    #  Utility helpers
+    # ===================================================================== #
+
+    @staticmethod
+    def _get_poster_url(obj) -> Optional[str]:
+        """Extract poster URL from a Movie or Series object."""
+        # Try the logo FK first
+        if hasattr(obj, "logo") and obj.logo:
+            return obj.logo.url
+        # Fallback to custom_properties
+        cp = obj.custom_properties or {}
+        if cp.get("cover"):
+            return cp["cover"]
+        if cp.get("cover_big"):
+            return cp["cover_big"]
+        if cp.get("stream_icon"):
+            return cp["stream_icon"]
+        return None
+
+    @staticmethod
+    def _sanitise_filename(name: str) -> str:
+        """Remove or replace characters unsafe for filenames."""
+        # Replace path-unsafe chars
+        name = re.sub(r'[<>:"/\\|?*]', "", name)
+        # Collapse whitespace
+        name = re.sub(r"\s+", " ", name).strip()
+        # Truncate
+        if len(name) > 200:
+            name = name[:200]
+        return name
+
+    @staticmethod
+    def _write_if_changed(path: str, content: str) -> bool:
+        """Write file only if content differs (avoids unnecessary I/O)."""
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    if f.read() == content:
+                        return False
+        except Exception:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+
+    @staticmethod
+    def _add_text_el(parent: ET.Element, tag: str, text: str):
+        el = ET.SubElement(parent, tag)
+        el.text = text
+        return el
+
+    @staticmethod
+    def _xml_to_string(root: ET.Element) -> str:
+        """Pretty-print XML with declaration."""
+        ET.indent(root)
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            + ET.tostring(root, encoding="unicode")
+        )
