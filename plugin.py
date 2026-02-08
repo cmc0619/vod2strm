@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.13
+Version: 0.0.14
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -64,6 +64,7 @@ try:
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
+    from apps.m3u.models import M3UAccount
 except Exception:  # pragma: no cover
     from vod.models import (  # type: ignore
         Movie,
@@ -74,6 +75,7 @@ except Exception:  # pragma: no cover
         M3USeriesRelation,
         M3UVODCategoryRelation,
     )
+    from m3u.models import M3UAccount  # type: ignore
 
 # Celery (required - Dispatcharr depends on Celery to function)
 # Import is in try/except for testing purposes only
@@ -108,7 +110,11 @@ if not LOGGER.handlers:
 _FILE_LOGGER_CONFIGURED = False
 _LOG_LOCK = threading.Lock()
 _MANIFEST_LOCK = threading.Lock()  # Protects manifest dict from concurrent modification
-_SIGNALS_REGISTERED = False  # Track if signals have been registered (lazy init)
+
+# -------------------- Auto-Monitor State --------------------
+_monitor_thread = None          # Reference to daemon polling thread
+_monitor_stop_event = threading.Event()  # Signal to stop the monitor loop
+_monitor_lock = threading.Lock()  # Protects monitor start/stop operations
 
 
 # -------------------- Query Helpers --------------------
@@ -1702,7 +1708,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.13"
+    version = "0.0.14"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -1765,7 +1771,14 @@ class Plugin:
             "label": "Auto-run after VOD Refresh",
             "type": "boolean",
             "default": False,
-            "help": "Automatically generate .strm files after Dispatcharr refreshes VOD content from providers. Uses 30-second debounce to batch multiple refreshes.",
+            "help": "When the auto-monitor is running, automatically generate .strm files after Dispatcharr refreshes VOD content from providers.",
+        },
+        {
+            "id": "monitor_interval",
+            "label": "Monitor Poll Interval (seconds)",
+            "type": "number",
+            "default": 60,
+            "help": "How often the auto-monitor checks for completed VOD refreshes. Lower values detect faster but use more resources.",
         },
         {
             "id": "debug_logging",
@@ -1817,6 +1830,14 @@ class Plugin:
         {"id": "generate_series", "label": "Generate Series"},
         {"id": "generate_all", "label": "Generate All"},
         {"id": "db_cleanup", "label": "🗑️ Delete ALL Episodes"},
+        {"id": "start_auto_monitor", "label": "▶️ Start Auto-Monitor",
+         "description": "Start background thread that watches for VOD refresh completions and auto-generates STRM files.",
+         "confirm": {"required": True, "title": "Start Auto-Monitor?",
+                     "message": "This starts a background polling thread that watches for VOD refresh completions. It will auto-generate STRM files when refreshes complete. The 'Auto-run after VOD Refresh' setting must also be enabled."}},
+        {"id": "stop_auto_monitor", "label": "⏹️ Stop Auto-Monitor",
+         "description": "Stop the background monitoring thread."},
+        {"id": "monitor_status", "label": "📊 Monitor Status",
+         "description": "Check if the auto-monitor is running."},
     ]
 
     def run(self, action_id, params, context):
@@ -1829,9 +1850,6 @@ class Plugin:
             params: Parameters from the UI (usually empty dict)
             context: Dict with "settings", "logger", and "actions"
         """
-        # Ensure signal handlers are registered (lazy init after DB is ready)
-        _ensure_signals_registered()
-
         # Extract settings from context (new plugin API)
         settings = context.get("settings", {})
         action = action_id  # Keep same variable name for compatibility
@@ -1855,6 +1873,17 @@ class Plugin:
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
 
+        # ---- Auto-Monitor actions ----
+        if action == "start_auto_monitor":
+            return _start_auto_monitor(settings)
+
+        if action == "stop_auto_monitor":
+            return _stop_auto_monitor()
+
+        if action == "monitor_status":
+            return _monitor_status()
+
+        # ---- Data actions ----
         if action == "db_stats":
             # Database statistics - run synchronously, return immediately
             try:
@@ -2007,260 +2036,229 @@ else:
     celery_generate_all = None
 
 
-# -------------------- Auto-run after VOD refresh --------------------
+# -------------------- Auto-Monitor: DB Polling --------------------
+#
+# Replaces the broken signal-based approach (v0.0.13 and earlier).
+#
+# WHY SIGNALS DON'T WORK:
+# 1. Dispatcharr's VOD refresh uses bulk_create/bulk_update which bypass
+#    Django's post_save signals entirely.
+# 2. Even when signals did fire, they only registered in the web process
+#    (via Plugin.run() -> _ensure_signals_registered()), but VOD refresh
+#    runs in the Celery worker process where plugin code isn't loaded.
+#
+# HOW THE MONITOR WORKS:
+# - A daemon thread polls M3UAccount.updated_at every N seconds.
+# - When it detects a VOD-enabled account whose updated_at changed AND
+#   whose last_message indicates a completed VOD refresh, it triggers
+#   _run_job_sync(mode="all") with fresh settings from the database.
+# - The distributed cache lock (AUTO_RUN_CACHE_KEY) prevents concurrent runs.
+# - The thread stops when _monitor_stop_event is set or plugin is disabled.
+#
+# COST: ~2 lightweight DB queries per poll cycle. No process boundary issues.
 
-# Debounce state for auto-run (process-local for timer management)
-_auto_run_debounce_timer = None
-_auto_run_lock = threading.Lock()
-
-# Cross-process coordination using Django cache
-# Cache key tracks whether auto-run is currently executing across all workers
 AUTO_RUN_CACHE_KEY = "vod2strm_auto_run_in_progress"
 
+# Track last-seen updated_at per account to avoid re-triggering
+_monitor_last_seen: Dict[int, datetime] = {}
 
-def _schedule_auto_run_after_vod_refresh():
-    """
-    Schedule an auto-run with 30-second debounce.
-    Multiple VOD refreshes within 30 seconds will only trigger one generation.
-    """
-    global _auto_run_debounce_timer
 
-    # Load settings to check if auto-run is enabled
+def _is_vod_refresh_complete(account) -> bool:
+    """
+    Heuristic: check if the account's last_message indicates a completed VOD refresh.
+
+    Dispatcharr sets last_message on M3UAccount after various operations.
+    We look for messages that indicate VOD content was successfully refreshed.
+    """
+    msg = (getattr(account, "last_message", None) or "").lower()
+    if not msg:
+        return False
+    # Known completion patterns from Dispatcharr's VOD refresh pipeline
+    return any(phrase in msg for phrase in (
+        "vod refresh completed",
+        "batch vod refresh",
+        "vod content refreshed",
+        "refreshed successfully",
+        # Dispatcharr's M3U refresh completion messages that include VOD
+        "streams processed",
+    ))
+
+
+def _monitor_check() -> None:
+    """
+    Single poll cycle: check all VOD-enabled M3U accounts for completed refreshes.
+    If a refresh is detected, trigger full STRM generation.
+    """
+    global _monitor_last_seen
+
     try:
-        from apps.plugins.models import PluginConfig
-        plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-        if not plugin_config or not plugin_config.settings:
-            return
+        accounts = M3UAccount.objects.filter(
+            is_active=True,
+            enable_vod=True,
+        ).only("id", "name", "updated_at", "last_message")
 
-        # Check if plugin is enabled (respects UI disable toggle)
-        if not plugin_config.enabled:
-            LOGGER.debug("Auto-run skipped: plugin is disabled")
-            return
+        triggered = False
+        for acct in accounts:
+            updated = acct.updated_at
+            if updated is None:
+                continue
 
-        settings = plugin_config.settings
-        if not settings.get("auto_run_after_vod_refresh", False):
-            return  # Feature disabled
+            last_seen = _monitor_last_seen.get(acct.id)
 
-        with _auto_run_lock:
-            # Cancel existing timer
-            if _auto_run_debounce_timer:
-                _auto_run_debounce_timer.cancel()
+            # First time seeing this account — record timestamp, don't trigger
+            if last_seen is None:
+                _monitor_last_seen[acct.id] = updated
+                continue
 
-            # Schedule new run in 30 seconds
-            def run_generation():
-                """
-                Execute debounced STRM generation job.
+            # Account was updated since we last checked
+            if updated > last_seen:
+                _monitor_last_seen[acct.id] = updated
 
-                Reloads settings from database to avoid using stale settings captured
-                in closure. Re-checks plugin enabled state before executing.
-                Uses Django cache for cross-process coordination to prevent multiple
-                workers from running simultaneously. Cache key acts as distributed lock.
-                """
-                from django.core.cache import cache
-
-                LOGGER.info("Auto-run triggered after VOD refresh (30s debounce elapsed)")
-
-                # Try to acquire distributed lock using cache (atomic operation)
-                # set with nx=True (only set if not exists) acts as a lock
-                # Timeout of 3600s (1 hour) prevents stuck locks if process crashes
-                lock_acquired = cache.add(AUTO_RUN_CACHE_KEY, "locked", timeout=3600)
-
-                if not lock_acquired:
-                    LOGGER.info("Auto-run already in progress in another worker, skipping")
-                    return
-
-                try:
-                    # Reload settings from database (avoid stale settings from closure)
-                    from apps.plugins.models import PluginConfig
-                    plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
-
-                    # Double-check plugin is still enabled before running
-                    if not plugin_config or not plugin_config.enabled:
-                        LOGGER.info("Auto-run cancelled: plugin was disabled during debounce window")
-                        return
-
-                    # Double-check auto-run is still enabled
-                    current_settings = plugin_config.settings or {}
-                    if not current_settings.get("auto_run_after_vod_refresh", False):
-                        LOGGER.info("Auto-run cancelled: feature was disabled during debounce window")
-                        return
-
-                    _run_job_sync(
-                        mode="all",
-                        output_root=current_settings.get("output_root") or DEFAULT_ROOT,
-                        base_url=current_settings.get("base_url") or DEFAULT_BASE_URL,
-                        write_nfos=bool(current_settings.get("write_nfos", True)),
-                        cleanup_mode=current_settings.get("cleanup_mode", CLEANUP_OFF),
-                        concurrency=int(current_settings.get("concurrency") or 4),
-                        debug_logging=bool(current_settings.get("debug_logging", False)),
-                        dry_run=False,
-                        adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
-                        clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
-                        use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
-                        multi_provider_mode=bool(current_settings.get("multi_provider_mode", False)),
+                if _is_vod_refresh_complete(acct):
+                    LOGGER.info(
+                        "Auto-monitor: VOD refresh detected for account '%s' (id=%s, updated=%s, msg='%s')",
+                        acct.name, acct.id, updated, (acct.last_message or "")[:80]
                     )
-                finally:
-                    # Release distributed lock
-                    cache.delete(AUTO_RUN_CACHE_KEY)
-                    LOGGER.debug("Auto-run completed, lock released")
+                    triggered = True
 
-            _auto_run_debounce_timer = threading.Timer(30.0, run_generation)
-            _auto_run_debounce_timer.daemon = True
-            _auto_run_debounce_timer.start()
-            LOGGER.debug("Auto-run scheduled in 30 seconds (debounced)")
+        if triggered:
+            _auto_run_generation()
 
     except Exception as e:
-        LOGGER.warning("Failed to schedule auto-run after VOD refresh: %s", e)
+        LOGGER.warning("Auto-monitor check failed: %s", e)
 
 
-def _ensure_signals_registered():
+def _auto_run_generation() -> None:
     """
-    Lazily register Django signal handlers when first needed (after DB is ready).
-
-    IMPORTANT: Dispatcharr changed plugin loading in commit 1200d7d (Sept 2025).
-    Plugins now load in two phases:
-      1. discover_plugins(sync_db=False) - before DB/migrations ready
-      2. discover_plugins(sync_db=True) - after migrations complete
-
-    Module-level code executes during phase 1 (DB not ready), but Python's
-    module caching prevents it from running again in phase 2. This function
-    provides lazy initialization that runs when Plugin.run() is first called,
-    ensuring signals register after the database is fully ready.
+    Execute STRM generation with fresh settings from the database.
+    Uses distributed cache lock to prevent concurrent runs.
     """
-    global _SIGNALS_REGISTERED
+    from django.core.cache import cache
 
-    # Use lock to prevent race conditions during concurrent initialization
-    with _LOG_LOCK:
-        if _SIGNALS_REGISTERED:
-            return  # Already registered
+    LOGGER.info("Auto-monitor: triggering STRM generation")
 
-        try:
-            from django.db.models.signals import post_save
-            from django.dispatch import receiver
+    # Acquire distributed lock (prevents concurrent runs across processes)
+    lock_acquired = cache.add(AUTO_RUN_CACHE_KEY, "locked", timeout=3600)
+    if not lock_acquired:
+        LOGGER.info("Auto-monitor: generation already in progress (lock held), skipping")
+        return
 
-            # Import models to verify DB is ready
-            try:
-                from apps.vod.models import (
-                    Episode,
-                    Movie,
-                    M3UMovieRelation,
-                    M3UEpisodeRelation,
-                )
-            except ImportError:
-                from vod.models import (
-                    Episode,
-                    Movie,
-                    M3UMovieRelation,
-                    M3UEpisodeRelation,
-                )
+    try:
+        # Reload settings fresh from database
+        from apps.plugins.models import PluginConfig
+        plugin_config = PluginConfig.objects.filter(key="vod2strm").first()
 
-            # Define signal handlers
-            @receiver(post_save, sender=Episode)
-            def on_episode_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when Episode model is saved.
+        if not plugin_config or not plugin_config.enabled:
+            LOGGER.info("Auto-monitor: plugin disabled, skipping generation")
+            return
 
-                Schedules auto-run generation only when NEW episodes are created (not updates).
-                Checks cache-based distributed lock to prevent infinite loops when our own
-                _maybe_internal_refresh_series() creates episodes during generation.
-                """
-                from django.core.cache import cache
+        current_settings = plugin_config.settings or {}
+        if not current_settings.get("auto_run_after_vod_refresh", False):
+            LOGGER.info("Auto-monitor: 'Auto-run after VOD Refresh' setting is disabled, skipping")
+            return
 
-                # Don't trigger if we're already running (prevents infinite loop)
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
-
-            @receiver(post_save, sender=Movie)
-            def on_movie_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when Movie model is saved.
-
-                Schedules auto-run generation only when NEW movies are created (not updates).
-                Checks cache-based distributed lock to prevent re-triggering during active runs.
-                """
-                from django.core.cache import cache
-
-                # Don't trigger if we're already running
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
-
-            @receiver(post_save, sender=M3UMovieRelation)
-            def on_movie_relation_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when M3UMovieRelation is saved.
-
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing movies get linked to a new/higher priority provider.
-                """
-                from django.core.cache import cache
-
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
-
-            @receiver(post_save, sender=M3UEpisodeRelation)
-            def on_episode_relation_saved(sender, instance, created, **kwargs):
-                """
-                Django signal handler triggered when M3UEpisodeRelation is saved.
-
-                Schedules auto-run when new provider relations are created. This catches
-                the scenario where existing episodes get linked to a new/higher priority provider.
-                """
-                from django.core.cache import cache
-
-                if created and not cache.get(AUTO_RUN_CACHE_KEY):
-                    _schedule_auto_run_after_vod_refresh()
-
-            _SIGNALS_REGISTERED = True
-            LOGGER.info("VOD refresh signal handlers registered successfully (lazy init)")
-
-        except ImportError as e:
-            LOGGER.warning("Could not register VOD refresh signal handlers (models not available): %s", e)
-        except Exception as e:
-            LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
+        _run_job_sync(
+            mode="all",
+            output_root=current_settings.get("output_root") or DEFAULT_ROOT,
+            base_url=current_settings.get("base_url") or DEFAULT_BASE_URL,
+            write_nfos=bool(current_settings.get("write_nfos", True)),
+            cleanup_mode=current_settings.get("cleanup_mode", CLEANUP_OFF),
+            concurrency=int(current_settings.get("concurrency") or 4),
+            debug_logging=bool(current_settings.get("debug_logging", False)),
+            dry_run=False,
+            adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
+            clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
+            use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
+            multi_provider_mode=bool(current_settings.get("multi_provider_mode", False)),
+        )
+        LOGGER.info("Auto-monitor: STRM generation completed successfully")
+    except Exception as e:
+        LOGGER.exception("Auto-monitor: STRM generation failed: %s", e)
+    finally:
+        cache.delete(AUTO_RUN_CACHE_KEY)
+        LOGGER.debug("Auto-monitor: generation lock released")
 
 
-# ============================================================================
-# OLD MODULE-LEVEL SIGNAL REGISTRATION (DISABLED)
-# ============================================================================
-# This code was removed because Dispatcharr commit 1200d7d (Sept 2025) changed
-# plugin loading to happen before the database is ready. Module-level code
-# executes during initial import, but Python's module caching prevents it from
-# running again after migrations complete. Signal registration now happens via
-# _ensure_signals_registered() which is called lazily from Plugin.run().
-# ============================================================================
-#
-# try:
-#     from django.db.models.signals import post_save, post_delete
-#     from django.dispatch import receiver
-#
-#     @receiver(post_save, sender=Episode)
-#     def on_episode_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=Movie)
-#     def on_movie_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=M3UMovieRelation)
-#     def on_movie_relation_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     @receiver(post_save, sender=M3UEpisodeRelation)
-#     def on_episode_relation_saved(sender, instance, created, **kwargs):
-#         from django.core.cache import cache
-#         if created and not cache.get(AUTO_RUN_CACHE_KEY):
-#             _schedule_auto_run_after_vod_refresh()
-#
-#     LOGGER.info("VOD refresh signal handlers registered (including provider relation handlers)")
-#
-# except ImportError:
-#     LOGGER.warning("Could not register VOD refresh signal handlers (Django signals not available)")
-# except Exception as e:
-#     LOGGER.warning("Failed to register VOD refresh signal handlers: %s", e)
-# ============================================================================
+def _monitor_loop(interval: int) -> None:
+    """
+    Main loop for the monitor daemon thread.
+    Runs _monitor_check() every `interval` seconds until stopped.
+    """
+    LOGGER.info("Auto-monitor thread started (poll interval: %ds)", interval)
+    while not _monitor_stop_event.is_set():
+        _monitor_check()
+        # Use wait() instead of sleep() so we can be interrupted immediately
+        _monitor_stop_event.wait(timeout=interval)
+    LOGGER.info("Auto-monitor thread stopped")
+
+
+def _start_auto_monitor(settings: dict) -> dict:
+    """Start the auto-monitor daemon thread."""
+    global _monitor_thread
+
+    with _monitor_lock:
+        # Check if already running
+        if _monitor_thread is not None and _monitor_thread.is_alive():
+            return {"status": "ok", "message": "Auto-monitor is already running."}
+
+        if not settings.get("auto_run_after_vod_refresh", False):
+            return {
+                "status": "error",
+                "message": "Enable 'Auto-run after VOD Refresh' in settings first.",
+            }
+
+        interval = max(10, int(settings.get("monitor_interval") or 60))
+
+        _monitor_stop_event.clear()
+        _monitor_last_seen.clear()
+
+        _monitor_thread = threading.Thread(
+            target=_monitor_loop,
+            args=(interval,),
+            name="vod2strm-auto-monitor",
+            daemon=True,
+        )
+        _monitor_thread.start()
+
+        return {
+            "status": "ok",
+            "message": f"Auto-monitor started (polling every {interval}s). "
+                       f"It will auto-generate STRM files when VOD refreshes complete.",
+        }
+
+
+def _stop_auto_monitor() -> dict:
+    """Stop the auto-monitor daemon thread."""
+    global _monitor_thread
+
+    with _monitor_lock:
+        if _monitor_thread is None or not _monitor_thread.is_alive():
+            _monitor_thread = None
+            return {"status": "ok", "message": "Auto-monitor is not running."}
+
+        _monitor_stop_event.set()
+        _monitor_thread.join(timeout=10)
+        alive = _monitor_thread.is_alive()
+        _monitor_thread = None
+
+        if alive:
+            return {"status": "ok", "message": "Auto-monitor stop requested (thread still winding down)."}
+        return {"status": "ok", "message": "Auto-monitor stopped."}
+
+
+def _monitor_status() -> dict:
+    """Report auto-monitor status."""
+    with _monitor_lock:
+        running = _monitor_thread is not None and _monitor_thread.is_alive()
+
+    if running:
+        accounts_tracked = len(_monitor_last_seen)
+        msg = (
+            f"Auto-monitor is RUNNING.\n"
+            f"Tracking {accounts_tracked} VOD-enabled account(s).\n"
+            f"Thread: {_monitor_thread.name if _monitor_thread else 'N/A'}"
+        )
+    else:
+        msg = "Auto-monitor is NOT running. Click 'Start Auto-Monitor' to begin."
+
+    return {"status": "ok", "message": msg}
