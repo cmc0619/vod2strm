@@ -148,14 +148,41 @@ def _eligible_movie_queryset():
         config = PluginConfig.objects.filter(key="vod2strm").first()
         settings = config.settings if config else {}
         filter_movie_ids_str = settings.get("filter_movie_ids", "").strip()
+        filter_movie_category_ids_str = settings.get("filter_movie_category_ids", "").strip()
     except Exception:
         filter_movie_ids_str = ""
+        filter_movie_category_ids_str = ""
 
+    movie_ids = []
+    category_ids = []
+    
     # Parse UI IDs
     if filter_movie_ids_str:
-        ui_ids = [int(x.strip()) for x in filter_movie_ids_str.split(',') if x.strip().isdigit()]
-        if ui_ids:
-            base_qs = base_qs.filter(id__in=ui_ids)
+        movie_ids = [
+            int(x.strip())
+            for x in filter_movie_ids_str.split(',')
+            if x.strip().isdigit()
+        ]
+
+    if filter_movie_category_ids_str:
+        category_ids = [
+            int(x.strip())
+            for x in filter_movie_category_ids_str.split(',')
+            if x.strip().isdigit()
+        ]
+    
+    
+    if movie_ids or category_ids:
+        filters = Q()
+
+        if movie_ids:
+            filters |= Q(id__in=movie_ids)
+
+        if category_ids:
+            category_match = allowed_relations.filter(category_id__in=category_ids)
+            filters |= Exists(category_match)
+
+        base_qs = base_qs.filter(filters)
 
     return base_qs
 
@@ -181,14 +208,39 @@ def _eligible_series_queryset():
         config = PluginConfig.objects.filter(key="vod2strm").first()
         settings = config.settings if config else {}
         filter_series_ids_str = settings.get("filter_series_ids", "").strip()
+        filter_series_category_ids_str = settings.get("filter_series_category_ids", "").strip()
     except Exception:
         filter_series_ids_str = ""
+        filter_series_category_ids_str = ""
 
-    # Parse UI IDs
+    series_ids = []
+    category_ids = []
+
     if filter_series_ids_str:
-        ui_ids = [int(x.strip()) for x in filter_series_ids_str.split(',') if x.strip().isdigit()]
-        if ui_ids:
-            base_qs = base_qs.filter(id__in=ui_ids)
+        series_ids = [
+            int(x.strip())
+            for x in filter_series_ids_str.split(',')
+            if x.strip().isdigit()
+        ]
+
+    if filter_series_category_ids_str:
+        category_ids = [
+            int(x.strip())
+            for x in filter_series_category_ids_str.split(',')
+            if x.strip().isdigit()
+        ]
+
+    if series_ids or category_ids:
+        filters = Q()
+
+        if series_ids:
+            filters |= Q(id__in=series_ids)
+
+        if category_ids:
+            category_match = allowed_relations.filter(category_id__in=category_ids)
+            filters |= Exists(category_match)
+
+        base_qs = base_qs.filter(filters)
 
     return base_qs
 
@@ -1792,14 +1844,28 @@ class Plugin:
             "label": "Content Filter: Movie IDs",
             "type": "string",
             "default": "",
-            "help": "Comma-separated database IDs to include (e.g., '11730,14359'). Leave empty to generate all.",
+            "help": "Comma-separated movie database IDs to include (e.g., '11730,14359'). Leave empty to include all.",
+        },
+        {
+            "id": "filter_movie_category_ids",
+            "label": "Content Filter: Movie Category IDs",
+            "type": "string",
+            "default": "",
+            "help": "Comma-separated provider category IDs (e.g., '12,15'). Movies from these categories will be included.",
         },
         {
             "id": "filter_series_ids",
             "label": "Content Filter: Series IDs",
             "type": "string",
             "default": "",
-            "help": "Comma-separated database IDs to include (e.g., '1521,1797,2736'). Leave empty to generate all.",
+            "help": "Comma-separated series database IDs to include (e.g., '1521,1797,2736'). Leave empty to include all.",
+        },
+        {
+            "id": "filter_series_category_ids",
+            "label": "Content Filter: Series Category IDs",
+            "type": "string",
+            "default": "",
+            "help": "Comma-separated provider category IDs (e.g., '3,9'). Series from these categories will be included.",
         },
         {
             "id": "multi_provider_mode",
