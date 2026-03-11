@@ -170,12 +170,19 @@ def _eligible_movie_queryset():
             for x in filter_movie_category_ids_str.split(',')
             if x.strip().isdigit()
         ]
-
+    
+    
     if movie_ids or category_ids:
-        base_qs = base_qs.filter(
-            Q(id__in=movie_ids) |
-            Q(m3u_relations__category_id__in=category_ids)
-        ).distinct()
+        filters = Q()
+
+        if movie_ids:
+            filters |= Q(id__in=movie_ids)
+
+        if category_ids:
+            category_match = allowed_relations.filter(category_id__in=category_ids)
+            filters |= Exists(category_match)
+
+        base_qs = base_qs.filter(filters)
 
     return base_qs
 
@@ -224,10 +231,16 @@ def _eligible_series_queryset():
         ]
 
     if series_ids or category_ids:
-        base_qs = base_qs.filter(
-            Q(id__in=series_ids) |
-            Q(m3u_relations__category_id__in=category_ids)
-        ).distinct()
+        filters = Q()
+
+        if series_ids:
+            filters |= Q(id__in=series_ids)
+
+        if category_ids:
+            category_match = allowed_relations.filter(category_id__in=category_ids)
+            filters |= Exists(category_match)
+
+        base_qs = base_qs.filter(filters)
 
     return base_qs
 
